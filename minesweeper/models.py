@@ -44,4 +44,12 @@ class CNNPolicy(nn.Module):
                     self.policy_head.bias = nn.Parameter(torch.zeros(2, dtype=self.policy_head.weight.dtype, device=self.policy_head.weight.device))
                 self.policy_head.bias[1] += bias_delta
 
+    def set_flag_bias(self, bias_value: float):
+        """Set the absolute bias of the flag logit channel (index 1)."""
+        with torch.no_grad():
+            if isinstance(self.policy_head, nn.Conv2d) and self.policy_head.out_channels == 2:
+                if self.policy_head.bias is None:
+                    self.policy_head.bias = nn.Parameter(torch.zeros(2, dtype=self.policy_head.weight.dtype, device=self.policy_head.weight.device))
+                self.policy_head.bias[1] = bias_value
+
 

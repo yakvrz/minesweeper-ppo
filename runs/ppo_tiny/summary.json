@@ -1,1 +1,0 @@
-{"checkpoint": "ckpt_200.pt", "reveal_only": {"win_rate": 0.71875, "avg_steps": 8.34375, "avg_progress": 0.0, "invalid_rate": 0.0}, "full": {"win_rate": 0.03125, "avg_steps": 106.03125, "avg_progress": 0.0, "invalid_rate": 0.0}}

@@ -77,6 +77,7 @@ class MinesweeperEnv:
         self.step_count = 0
         self._last_new_reveals = 0
         self.steps_since_progress = 0
+        self._last_toggles = 0
 
         return {
             "obs": self._build_obs(),
@@ -164,8 +165,11 @@ class MinesweeperEnv:
         # Toggle cost
         if self.cfg.flag_toggle_cost > 0.0:
             toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
+            self._last_toggles = toggles
             if toggles > 0:
                 reward += -float(self.cfg.flag_toggle_cost) * float(toggles)
+        else:
+            self._last_toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
 
         # Holding tax: penalize carrying many flags (tiny only recommended)
         if self.cfg.holding_tax_per_flag > 0.0:
@@ -218,10 +222,14 @@ class MinesweeperEnv:
             remaining_mines_ratio = remaining_mines / max(1, total_mines)
         tp_flags = int((self.flags & self.mine_mask).sum()) if self.first_click_done else 0
         fp_flags = int((self.flags & (~self.mine_mask)).sum()) if self.first_click_done else 0
+        total_cells = self.H * self.W
+        revealed_frac = float(int(self.revealed.sum()) / max(1, total_cells))
         return {
             "step": int(self.step_count),
             "last_new_reveals": int(self._last_new_reveals),
             "remaining_mines_ratio": float(remaining_mines_ratio),
+            "revealed_frac": revealed_frac,
+            "toggles": int(self._last_toggles),
             "tp_flags": int(tp_flags),
             "fp_flags": int(fp_flags),
             "stagnation_steps": int(self.steps_since_progress),

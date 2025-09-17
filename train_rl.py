@@ -197,8 +197,9 @@ def main():
     in_channels = dummy["obs"].shape[1]
     model = CNNPolicy(in_channels=in_channels).to(device)
     # Bias the flag head down initially to prevent early flag dominance
+    # Flag bias schedule: start at -1.25 and relax toward 0 by update ~200 (implemented via per-update adjustments)
     try:
-        model.bias_flag_down(bias_delta=-1.5)
+        model.bias_flag_down(bias_delta=-1.25)
     except Exception:
         pass
     if args.init_ckpt:
@@ -224,10 +225,19 @@ def main():
         vec.set_frontier_only_reveal(update < cfg.frontier_mask_until_updates)
         # Constrain flags to frontier unknowns early (but don't disable)
         try:
-            vec.set_flag_frontier_only(update < max(100, cfg.frontier_mask_until_updates))
+            vec.set_flag_frontier_only(update < min(75, cfg.frontier_mask_until_updates))
         except Exception:
             pass
         reveal_only_now = update < cfg.disable_flags_until_updates
+        # Relax flag bias linearly toward 0 over first 200 updates
+        try:
+            if update < 200:
+                # bias from -1.25 to 0
+                frac = (update + 1) / 200.0
+                current_bias = -1.25 * (1.0 - frac)
+                model.set_flag_bias(current_bias)
+        except Exception:
+            pass
         t0 = time.time()
         buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device, reveal_only=reveal_only_now)
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)

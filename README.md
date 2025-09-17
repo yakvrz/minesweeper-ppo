@@ -21,6 +21,28 @@ The tiny config enables:
 - Early constraint: flags masked to frontier unknowns
 - Stagnation cap to end stalled episodes
 
+## Current recommended tiny run (fresh)
+
+- Fresh PPO from scratch with flags+chord and lighter anti-dither:
+  - `python -u train_rl.py --config configs/tiny_6x6_6.yaml --out runs/ppo_tiny_fresh --updates 300`
+  - At the end, see `runs/ppo_tiny_fresh/summary.json` (full and reveal-only), `train_metrics.csv`.
+
+## Key knobs (EnvConfig)
+
+- `alpha_flag` (float): potential shaping weight over TP−FP flags.
+- `flag_toggle_cost` (float): per-step penalty per flag change.
+- `holding_tax_per_flag` (float): tiny per-flag tax per step (use sparingly; tiny only).
+- `chord_enabled` (bool): auto-reveal neighbors when flags match number.
+- `stagnation_cap_factor`, `stagnation_penalty`: terminates episodes with no progress.
+- `enforce_flag_budget` (bool): cap flags to `mine_count`.
+
+## Metrics to monitor
+
+- Full-mode win_rate (primary), avg_steps.
+- Flag precision = TP / max(1, TP+FP).
+- Toggle rate (toggles/step), longest no-progress span, avg new reveals/step.
+- Reveal-only win_rate (as ablation), not the primary gate once flags are trained.
+
 ## Layout
 
 - `minesweeper/env.py`: NumPy env + vectorized wrapper
