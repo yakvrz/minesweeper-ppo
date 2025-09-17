@@ -81,6 +81,7 @@ class MinesweeperEnv:
         reward = 0.0
         done = False
         info: Dict[str, Any] = {}
+        outcome: Optional[str] = None
 
         # Invalid: cannot act on revealed cells
         if self.revealed[r, c]:
@@ -114,6 +115,7 @@ class MinesweeperEnv:
                     self.revealed[r, c] = True
                     reward += float(self.cfg.loss_reward)
                     done = True
+                    outcome = "loss"
                 else:
                     newly_revealed = self._reveal_with_flood_fill(r, c)
                     # shaping by number of newly revealed safe cells
@@ -125,10 +127,14 @@ class MinesweeperEnv:
                     if int(self.revealed.sum()) >= total_safe:
                         reward += float(self.cfg.win_reward)
                         done = True
+                        outcome = "win"
 
         # step penalty always applied
         reward += -float(self.cfg.step_penalty)
         self.step_count += 1
+
+        if done:
+            info["outcome"] = outcome
 
         obs_dict = {
             "obs": self._build_obs(),
@@ -362,18 +368,21 @@ class VecMinesweeper:
         next_mask = []
         rewards = np.zeros((self.num_envs,), dtype=np.float32)
         dones = np.zeros((self.num_envs,), dtype=bool)
-        infos: Dict[str, Any] = {"aux": []}
+        infos: Dict[str, Any] = {"aux": [], "outcome": []}
 
         for i, e in enumerate(self.envs):
-            d, r, done, info = e.step(int(actions[i]))
+            d_step, r, done, info_step = e.step(int(actions[i]))
+            outcome = info_step.get("outcome") if done else None
+            # auto-reset done envs to streamline rollouts
+            d = d_step
             if done:
-                # auto-reset done envs to streamline rollouts
                 d = e.reset()
             next_obs.append(d["obs"])  # [C,H,W]
             next_mask.append(d["action_mask"])  # [A]
             rewards[i] = r
             dones[i] = done
             infos["aux"].append(d.get("aux", {}))
+            infos["outcome"].append(outcome)
 
         batch = {
             "obs": np.stack(next_obs, axis=0),

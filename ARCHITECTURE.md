@@ -71,71 +71,11 @@ Each environment instance maintains:
 
 ## Environment API
 
-```python
-# env.py
-from dataclasses import dataclass
-import numpy as np
-from typing import Tuple, Dict, Any
-
-@dataclass
-class EnvConfig:
-    H: int = 8
-    W: int = 8
-    mine_count: int = 10
-    guarantee_safe_neighborhood: bool = True  # avoid 8-neighborhood on first click
-    progress_reward: float = 0.01
-    win_reward: float = 1.0
-    loss_reward: float = -1.0
-    step_penalty: float = 1e-4
-    invalid_penalty: float = 1e-3
-    flag_correct_reward: float = 0.002
-    flag_incorrect_reward: float = -0.002
-    use_flag_shaping: bool = False
-
-class MinesweeperEnv:
-    def __init__(self, cfg: EnvConfig, seed: int):
-        ...
-
-    def reset(self) -> Dict[str, Any]:
-        """Returns observation dict with fields:
-           - obs: np.float32 tensor [C, H, W]
-           - action_mask: bool [2*H*W]
-           - aux: dict with scalars (remaining_mines_ratio, step, ...), optional
-        """
-
-    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, Dict]:
-        """Action ∈ [0, 2*H*W).
-           0..H*W-1 = reveal at idx; H*W..2*H*W-1 = flag toggle at idx.
-           Returns (obs_dict, reward, done, info).
-        """
-
-    @property
-    def action_space(self) -> int:
-        return 2 * self.cfg.H * self.cfg.W
-
-    @property
-    def obs_channels(self) -> int:
-        # revealed, flags, one-hot 0..8 (9 channels) => 11 channels total initially
-        return 11
-```
+Environment exposes a dataclass `EnvConfig` and a class `MinesweeperEnv` with `reset()`/`step()` methods returning observation dicts including an action mask; see `minesweeper/env.py`.
 
 ### Vectorized Wrapper
 
-```python
-class VecMinesweeper:
-    """Batched env for throughput. Keeps N independent env states on CPU."""
-    def __init__(self, num_envs: int, cfg: EnvConfig, seed: int):
-        ...
-
-    def reset(self) -> Dict[str, np.ndarray]:
-        """Stacks observations across envs:
-           - obs: [N, C, H, W]
-           - action_mask: [N, A]
-        """
-
-    def step(self, actions: np.ndarray) -> Tuple[Dict, np.ndarray, np.ndarray, Dict]:
-        """actions: [N] int32, returns batch of obs/reward/done/info."""
-```
+Vectorized wrapper `VecMinesweeper` batches N environments on CPU and provides `reset()` and `step()`; see `minesweeper/env.py`.
 
 ---
 
@@ -217,15 +157,7 @@ masked_logits = logits.masked_fill(~action_mask, -1e9)
 
 **API:**
 
-```python
-# rules.py
-from typing import List, Tuple, Optional
-
-def forced_moves(state) -> List[Tuple[str, int]]:
-    """Returns a list of moves [('reveal'|'flag', flat_idx), ...] that are provably correct.
-       Empty list if no forced move exists (i.e., guessing required).
-    """
-```
+Rule-based solver exposes `forced_moves(state)` returning provably correct reveal/flag moves; see `minesweeper/rules.py`.
 
 **Dataset generation**:
 
@@ -243,15 +175,7 @@ def forced_moves(state) -> List[Tuple[str, int]]:
 
 A small fully-convolutional network that preserves spatial structure and emits per-cell action logits.
 
-```
-Input [B, C, H, W]
-  -> ConvBlocks (3×3, channels: 32→64→64; GroupNorm/LayerNorm + ReLU)
-  -> Shared feature map [B, F, H, W]
-  Heads:
-    - PolicyHead: 1×1 conv → 2 logits per cell → reshape to [B, 2*H*W]
-    - ValueHead: global average pool → MLP → scalar V(s)
-    - (Optional) MineProbHead: 1×1 conv + sigmoid → [B, 1, H, W]
-```
+Backbone: 3×3 conv blocks (32→64→64) with normalization; heads: 1×1 conv policy (2 logits per cell, flattened to `2*H*W`) and value (GAP+MLP); optional mine-prob head; see `minesweeper/models.py`.
 
 ### Module Signatures
 
@@ -301,63 +225,11 @@ class CNNPolicy(nn.Module):
 
 ### Rollout & Buffer
 
-```python
-# buffers.py
-class RolloutBuffer:
-    def __init__(self, num_envs, steps, obs_shape, action_dim, device):
-        ...
-    def add(self, obs, actions, logp, rewards, dones, values, masks):
-        ...
-    def compute_gae(self, last_values, gamma=0.995, lam=0.95):
-        ...
-    def get_minibatches(self, batch_size):
-        ...
-```
+`RolloutBuffer` stores trajectories, computes GAE, and yields minibatches; see `minesweeper/buffers.py`.
 
 ### Training Step
 
-```python
-# ppo.py
-def ppo_update(model, optimizer, batch, cfg):
-    # Apply mask before log-softmax
-    logits, value, mine_logits = model(batch.obs, return_mine=cfg.aux_mine_weight > 0)
-    masked_logits = logits.masked_fill(~batch.action_mask, -1e9)
-
-    logp = torch.log_softmax(masked_logits, dim=-1)
-    logp_act = logp.gather(1, batch.actions.unsqueeze(1)).squeeze(1)
-
-    ratio = (logp_act - batch.old_logp).exp()
-    surr1 = ratio * batch.advantages
-    surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * batch.advantages
-    policy_loss = -torch.min(surr1, surr2).mean()
-
-    value_clipped = batch.values + (value - batch.values).clamp(-cfg.clip_eps_v, cfg.clip_eps_v)
-    v_loss1 = (value - batch.returns).pow(2)
-    v_loss2 = (value_clipped - batch.returns).pow(2)
-    value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
-
-    ent = -(torch.softmax(masked_logits, -1) * logp).sum(-1).mean()
-
-    loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * ent
-
-    if cfg.aux_mine_weight > 0:
-        # BCE with hidden mine mask labels (broadcast to batch)
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            mine_logits.squeeze(1), batch.mine_labels)
-        loss = loss + cfg.aux_mine_weight * bce
-
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-    optimizer.step()
-
-    return {
-      "loss": float(loss.item()),
-      "policy_loss": float(policy_loss.item()),
-      "value_loss": float(value_loss.item()),
-      "entropy": float(ent.item())
-    }
-```
+`ppo_update` applies action masking, clipped objective, value clipping, entropy bonus, and optional mine-head BCE; see `minesweeper/ppo.py`.
 
 ### PPO Hyperparameters (initial)
 
@@ -414,11 +286,7 @@ def ppo_update(model, optimizer, batch, cfg):
 
 ### Eval API
 
-```python
-# eval.py
-def evaluate(agent, env_cfg, episodes: int = 1000, seed: int = 0) -> Dict[str, float]:
-    """Returns dict with win_rate, avg_progress, steps_to_outcome, etc."""
-```
+`eval.py` provides `evaluate` (single-env) and `evaluate_vec` (vectorized) evaluators and a CLI.
 
 ### Visualization
 
@@ -511,42 +379,11 @@ ppo:
 
 ### Imitation
 
-```python
-# train_il.py (sketch)
-env = MinesweeperEnv(EnvConfig(), seed=0)
-dataset = ForcedMoveDataset(...)  # wraps generator
-model = CNNPolicy(in_channels=env.obs_channels).cuda()
-opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
-for batch in loader:
-    obs = batch.obs.cuda()                 # [B,C,H,W]
-    mask = batch.action_mask.cuda()        # [B,A]
-    logits, _, mine_logits = model(obs, return_mine=True)
-    logits = logits.masked_fill(~mask, -1e9)
-    ce = torch.nn.functional.cross_entropy(logits, batch.action)
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(
-        mine_logits.squeeze(1), batch.mine_labels)
-    loss = ce + 0.1 * bce
-    opt.zero_grad(); loss.backward(); opt.step()
-```
+Imitation training samples only forced-move states for CE/BCE; see `train_il.py`.
 
 ### PPO
 
-```python
-# train_rl.py (sketch)
-vec = VecMinesweeper(num_envs=256, cfg=EnvConfig(), seed=0)
-model = CNNPolicy(in_channels=vec.obs_channels()).cuda()
-opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
-for update in range(num_updates):
-    roll = collect_rollout(vec, model, steps=128, frontier_mask=update < 200)
-    roll.compute_gae(gamma=0.995, lam=0.95)
-    for _ in range(3):  # ppo_epochs
-        for batch in roll.get_minibatches(...):
-            stats = ppo_update(model, opt, batch, cfg=ppo_cfg)
-    if should_increase_difficulty(eval_stats):
-        mix_in_next_board()
-```
+RL training collects masked-action rollouts, runs PPO epochs, and can apply curriculum; see `train_rl.py`.
 
 ---
 

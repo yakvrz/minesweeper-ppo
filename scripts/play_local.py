@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os, sys
+
+# Ensure repo root is on sys.path when running from scripts/
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from minesweeper.env import EnvConfig, MinesweeperEnv
 from viz import ascii_from_env

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import time
+import logging
 from dataclasses import dataclass
 from typing import Dict
 
@@ -151,6 +154,10 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
+    # logging setup
+    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+    log = logging.getLogger("train_rl")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
@@ -184,18 +191,34 @@ def main():
         max_grad_norm=cfg.max_grad_norm,
     )
 
-    for update in tqdm(range(cfg.total_updates), desc="updates"):
+    progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
+    for update in progress:
         vec.set_frontier_only_reveal(update < cfg.frontier_mask_until_updates)
+        t0 = time.time()
         buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device)
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
         B = cfg.num_envs * cfg.steps_per_env
         minibatch_size = B // cfg.mini_batches
+        loss_sum = policy_sum = value_sum = ent_sum = 0.0
+        count = 0
         for _ in range(cfg.ppo_epochs):
             for batch in buffer.get_minibatches(minibatch_size):
                 stats = ppo_update(model, opt, batch, cfg=ppo_cfg)
+                loss_sum += stats["loss"]; policy_sum += stats["policy_loss"]; value_sum += stats["value_loss"]; ent_sum += stats["entropy"]; count += 1
 
         sched.step()
+        dt = time.time() - t0
+        if count > 0:
+            loss_avg = loss_sum / count
+            pol_avg = policy_sum / count
+            val_avg = value_sum / count
+            ent_avg = ent_sum / count
+        else:
+            loss_avg = pol_avg = val_avg = ent_avg = float('nan')
+
+        steps_this_update = cfg.num_envs * cfg.steps_per_env
+        log.info(f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | loss={loss_avg:.4f} pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f} | frontier={'on' if update < cfg.frontier_mask_until_updates else 'off'}")
 
         if (update + 1) % 10 == 0:
             ckpt_path = os.path.join(args.out, f"ckpt_{update+1}.pt")
