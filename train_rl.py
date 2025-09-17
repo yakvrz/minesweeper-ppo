@@ -160,6 +160,8 @@ def main():
     parser.add_argument("--init_ckpt", type=str, default=None, help="Optional init checkpoint from IL")
     parser.add_argument("--eval_episodes", type=int, default=64)
     parser.add_argument("--eval_num_envs", type=int, default=128)
+    parser.add_argument("--save_every", type=int, default=50, help="Save latest checkpoint every N updates")
+    parser.add_argument("--eval_quick_episodes", type=int, default=16, help="Episodes for quick periodic eval to track best")
     args = parser.parse_args()
 
     cfg, env_overrides = load_config(args.config)
@@ -212,6 +214,7 @@ def main():
 
     progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
     per_update_rows = []
+    best_full_win = -1.0
     for update in progress:
         vec.set_frontier_only_reveal(update < cfg.frontier_mask_until_updates)
         # Constrain flags to frontier unknowns early (but don't disable)
@@ -256,25 +259,29 @@ def main():
             "entropy": float(ent_avg),
         })
 
-        if (update + 1) % 10 == 0:
-            ckpt_path = os.path.join(args.out, f"ckpt_{update+1}.pt")
-            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_path)
-            # periodic eval history (quick reveal-only)
-            try:
-                m = evaluate_vec(
-                    model,
-                    env_cfg,
-                    episodes=min(32, args.eval_episodes),
-                    seed=0,
-                    num_envs=min(64, args.eval_num_envs),
-                    progress_every=0,
-                    reveal_only=True,
-                )
-                with open(os.path.join(args.out, "eval_history.jsonl"), "a") as f:
-                    rec = {"update": int(update + 1), **m}
-                    f.write(json.dumps(rec) + "\n")
-            except Exception as e:
-                log.warning(f"Periodic eval failed at update {update+1}: {e}")
+        # Save latest periodically (overwrite) and track best by quick full-mode eval
+        if (update + 1) % max(1, args.save_every) == 0:
+            ckpt_latest = os.path.join(args.out, "ckpt_latest.pt")
+            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_latest)
+        try:
+            m_quick = evaluate_vec(
+                model,
+                env_cfg,
+                episodes=min(args.eval_quick_episodes, args.eval_episodes),
+                seed=0,
+                num_envs=min(args.eval_num_envs, args.eval_quick_episodes),
+                progress_every=0,
+                reveal_only=False,
+                max_steps_per_episode=512,
+                reveal_fallback_every=25,
+            )
+            full_win = float(m_quick.get("win_rate", 0.0))
+            if full_win > best_full_win:
+                best_full_win = full_win
+                ckpt_best = os.path.join(args.out, "ckpt_best.pt")
+                torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "metric": m_quick}, ckpt_best)
+        except Exception as e:
+            log.warning(f"Quick eval failed at update {update+1}: {e}")
 
     # Export per-update CSV
     try:
@@ -288,17 +295,9 @@ def main():
         log.warning(f"Failed to write train_metrics.csv: {e}")
 
     # Final checkpoint
-    final_ckpt = os.path.join(args.out, f"ckpt_{cfg.total_updates}.pt")
-    if os.path.exists(final_ckpt):
-        last_ckpt = final_ckpt
-    else:
-        # find last saved ckpt
-        import glob, re
-        paths = glob.glob(os.path.join(args.out, "ckpt_*.pt"))
-        if paths:
-            last_ckpt = max(paths, key=lambda p: int(re.search(r"ckpt_(\\d+)\\.pt$", os.path.basename(p)).group(1)))
-        else:
-            last_ckpt = None
+    ckpt_final = os.path.join(args.out, "ckpt_final.pt")
+    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_final)
+    last_ckpt = ckpt_final
 
     # End-of-training evaluation (fast reveal-only + full with safeguards)
     try:
