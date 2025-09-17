@@ -23,6 +23,14 @@ class EnvConfig:
     flag_correct_reward: float = 0.002
     flag_incorrect_reward: float = -0.002
     use_flag_shaping: bool = False
+    # Flag shaping and behavior controls
+    alpha_flag: float = 0.0  # potential-based shaping weight (A). 0 disables
+    flag_toggle_cost: float = 0.0  # per-toggle penalty to reduce flip-flop
+    shaping_gamma: float = 0.995  # discount for potential-based shaping
+    chord_enabled: bool = True  # enable auto-chord reveals (B)
+    stagnation_cap_factor: int = 0  # end if no new reveals for factor * H * W steps; 0 disables
+    stagnation_penalty: float = 0.0  # penalty when ending due to stagnation
+    enforce_flag_budget: bool = False  # prevent new flags if budget (mine_count) reached
 
 
 class MinesweeperEnv:
@@ -53,6 +61,7 @@ class MinesweeperEnv:
 
         # Optional curriculum toggle: restrict reveal actions to frontier
         self.frontier_only_reveal: bool = False
+        self.flag_frontier_only: bool = False
 
         self.reset()
 
@@ -62,9 +71,11 @@ class MinesweeperEnv:
         self.adjacent_counts = np.zeros((self.H, self.W), dtype=np.uint8)
         self.revealed = np.zeros((self.H, self.W), dtype=bool)
         self.flags = np.zeros((self.H, self.W), dtype=bool)
+        self.flags_prev = self.flags.copy()
         self.first_click_done = False
         self.step_count = 0
         self._last_new_reveals = 0
+        self.steps_since_progress = 0
 
         return {
             "obs": self._build_obs(),
@@ -82,6 +93,9 @@ class MinesweeperEnv:
         done = False
         info: Dict[str, Any] = {}
         outcome: Optional[str] = None
+
+        # Keep previous flags for shaping and toggle cost
+        prev_flags = self.flags.copy()
 
         # Invalid: cannot act on revealed cells
         if self.revealed[r, c]:
@@ -129,6 +143,41 @@ class MinesweeperEnv:
                         done = True
                         outcome = "win"
 
+        # Auto-chord mechanic (B)
+        if not done and self.first_click_done and self.cfg.chord_enabled:
+            chord_new = self._maybe_auto_chord()
+            if chord_new > 0:
+                reward += float(self.cfg.progress_reward) * float(chord_new)
+                self._last_new_reveals += chord_new
+
+        # Potential-based shaping over flags (A)
+        if self.first_click_done and self.cfg.alpha_flag > 0.0:
+            tp_prev = int((prev_flags & self.mine_mask).sum())
+            fp_prev = int((prev_flags & (~self.mine_mask)).sum())
+            tp_now = int((self.flags & self.mine_mask).sum())
+            fp_now = int((self.flags & (~self.mine_mask)).sum())
+            phi_prev = float(self.cfg.alpha_flag) * float(tp_prev - fp_prev)
+            phi_now = float(self.cfg.alpha_flag) * float(tp_now - fp_now)
+            reward += float(self.cfg.shaping_gamma) * phi_now - phi_prev
+
+        # Toggle cost
+        if self.cfg.flag_toggle_cost > 0.0:
+            toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
+            if toggles > 0:
+                reward += -float(self.cfg.flag_toggle_cost) * float(toggles)
+
+        # Stagnation cap
+        if self._last_new_reveals > 0:
+            self.steps_since_progress = 0
+        else:
+            self.steps_since_progress += 1
+        cap_steps = int(self.cfg.stagnation_cap_factor) * self.H * self.W
+        if not done and cap_steps > 0 and self.steps_since_progress >= cap_steps:
+            if self.cfg.stagnation_penalty > 0.0:
+                reward += -float(self.cfg.stagnation_penalty)
+            done = True
+            outcome = outcome or "stagnation"
+
         # step penalty always applied
         reward += -float(self.cfg.step_penalty)
         self.step_count += 1
@@ -162,10 +211,15 @@ class MinesweeperEnv:
             flagged = int((self.flags & self.mine_mask).sum())
             remaining_mines = max(0, total_mines - flagged)
             remaining_mines_ratio = remaining_mines / max(1, total_mines)
+        tp_flags = int((self.flags & self.mine_mask).sum()) if self.first_click_done else 0
+        fp_flags = int((self.flags & (~self.mine_mask)).sum()) if self.first_click_done else 0
         return {
             "step": int(self.step_count),
             "last_new_reveals": int(self._last_new_reveals),
             "remaining_mines_ratio": float(remaining_mines_ratio),
+            "tp_flags": int(tp_flags),
+            "fp_flags": int(fp_flags),
+            "stagnation_steps": int(self.steps_since_progress),
         }
 
     def _build_obs(self) -> np.ndarray:
@@ -203,7 +257,16 @@ class MinesweeperEnv:
         else:
             reveal_valid = unrevealed
 
-        flag_valid = unrevealed
+        # Flag validity rules: allow removing any flagged-unrevealed; allow adding where permitted
+        flagged_unrevealed = unrevealed & self.flags
+        can_add = unrevealed & (~self.flags)
+        if self.flag_frontier_only and self.first_click_done:
+            frontier = self._compute_frontier()
+            can_add = can_add & frontier
+        if self.cfg.enforce_flag_budget and self.first_click_done:
+            if int(self.flags.sum()) >= int(self.cfg.mine_count):
+                can_add = np.zeros_like(can_add)
+        flag_valid = flagged_unrevealed | can_add
 
         reveal_mask = reveal_valid.reshape(-1)
         flag_mask = flag_valid.reshape(-1)
@@ -258,6 +321,27 @@ class MinesweeperEnv:
                         if not self.mine_mask[nr, nc]:
                             q.append((nr, nc))
         return newly_revealed
+
+    def _maybe_auto_chord(self) -> int:
+        """If a revealed number cell has adjacent flags equal to its number,
+        auto-reveal its other unrevealed, unflagged neighbors. Returns count of newly revealed.
+        """
+        total_new = 0
+        number_cells = np.argwhere(self.revealed & (self.adjacent_counts > 0))
+        for rr, cc in number_cells:
+            num = int(self.adjacent_counts[rr, cc])
+            neigh = self._neighbors(rr, cc)
+            flag_cnt = 0
+            to_reveal = []
+            for nr, nc in neigh:
+                if self.flags[nr, nc] and not self.revealed[nr, nc]:
+                    flag_cnt += 1
+                if (not self.flags[nr, nc]) and (not self.revealed[nr, nc]) and (not self.mine_mask[nr, nc]):
+                    to_reveal.append((nr, nc))
+            if flag_cnt == num and len(to_reveal) > 0:
+                for tr, tc in to_reveal:
+                    total_new += self._reveal_with_flood_fill(tr, tc)
+        return total_new
 
     def _place_mines_safe(self, first_click_rc: Tuple[int, int]) -> None:
         r0, c0 = first_click_rc
@@ -350,6 +434,10 @@ class VecMinesweeper:
     def set_frontier_only_reveal(self, enabled: bool) -> None:
         for e in self.envs:
             e.frontier_only_reveal = bool(enabled)
+
+    def set_flag_frontier_only(self, enabled: bool) -> None:
+        for e in self.envs:
+            e.flag_frontier_only = bool(enabled)
 
     def reset(self) -> Dict[str, np.ndarray]:
         obs_list = []

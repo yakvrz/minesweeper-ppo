@@ -73,6 +73,9 @@ def main():
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--aux", type=float, default=None, help="aux mine head weight")
+    parser.add_argument("--H", type=int, default=8)
+    parser.add_argument("--W", type=int, default=8)
+    parser.add_argument("--mines", type=int, default=10)
     args = parser.parse_args()
 
     cfg = ILConfig()
@@ -88,7 +91,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = MinesweeperEnv(EnvConfig(H=cfg.H, W=cfg.W, mine_count=cfg.mine_count, guarantee_safe_neighborhood=cfg.guarantee_safe_neighborhood), seed=args.seed)
+    env = MinesweeperEnv(EnvConfig(H=args.H, W=args.W, mine_count=args.mines, guarantee_safe_neighborhood=cfg.guarantee_safe_neighborhood), seed=args.seed)
     in_channels = env.obs_channels
     model = CNNPolicy(in_channels=in_channels).to(device)
     optim = AdamW(model.parameters(), lr=cfg.lr)
@@ -121,7 +124,11 @@ def main():
 
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             logits, _, mine_logits = model(obs, return_mine=True)
-            logits = logits.masked_fill(~mask, -1e9)
+            # Avoid float16 overflow in masking constant
+            neg_inf = -1e9
+            if logits.dtype in (torch.float16, torch.bfloat16):
+                neg_inf = -1e4
+            logits = logits.masked_fill(~mask, neg_inf)
             ce = nn.functional.cross_entropy(logits, action)
             bce = nn.functional.binary_cross_entropy_with_logits(mine_logits.squeeze(1), mine_labels)
             loss = ce + cfg.aux_mine_weight * bce

@@ -5,6 +5,8 @@ import os
 import sys
 import time
 import logging
+import json
+import csv
 from dataclasses import dataclass
 from typing import Dict
 
@@ -20,6 +22,7 @@ from minesweeper.env import EnvConfig, VecMinesweeper
 from minesweeper.models import CNNPolicy
 from minesweeper.buffers import RolloutBuffer
 from minesweeper.ppo import PPOConfig, ppo_update
+from eval import evaluate_vec
 
 
 @dataclass
@@ -46,6 +49,7 @@ class PPOTrainConfig:
     aux_mine_weight: float = 0.0
     frontier_mask_until_updates: int = 200
     total_updates: int = 1000
+    disable_flags_until_updates: int = 0
 
 
 def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
@@ -76,6 +80,7 @@ def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
         aux_mine_weight=ppo_d.get("aux_mine_weight", base.aux_mine_weight),
         frontier_mask_until_updates=ppo_d.get("frontier_mask_until_updates", base.frontier_mask_until_updates),
         total_updates=ppo_d.get("total_updates", base.total_updates),
+        disable_flags_until_updates=ppo_d.get("disable_flags_until_updates", base.disable_flags_until_updates),
     )
     return cfg, env_d
 
@@ -89,7 +94,7 @@ def _forward_policy(model: nn.Module, obs: torch.Tensor, mask: torch.Tensor) -> 
     return {"logits": masked_logits, "logp": logp, "probs": probs, "value": value}
 
 
-def collect_rollout(vec: VecMinesweeper, model: nn.Module, steps: int, device: torch.device) -> tuple[RolloutBuffer, Dict]:
+def collect_rollout(vec: VecMinesweeper, model: nn.Module, steps: int, device: torch.device, reveal_only: bool = False) -> tuple[RolloutBuffer, Dict]:
     vec_batch = vec.reset()
     N = vec_batch["obs"].shape[0]
     C, H, W = vec_batch["obs"].shape[1:]
@@ -103,6 +108,9 @@ def collect_rollout(vec: VecMinesweeper, model: nn.Module, steps: int, device: t
     for t in range(steps):
         obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
         mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+        if reveal_only:
+            half = mask.shape[-1] // 2
+            mask[:, half:] = False
 
         out = _forward_policy(model, obs, mask)
         probs = out["probs"]
@@ -135,6 +143,9 @@ def collect_rollout(vec: VecMinesweeper, model: nn.Module, steps: int, device: t
     # bootstrap value
     obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
     mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+    if reveal_only:
+        half = mask.shape[-1] // 2
+        mask[:, half:] = False
     with torch.no_grad():
         _, last_values = model(obs)
     return buffer, {"last_values": last_values}
@@ -146,6 +157,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="runs/ppo")
     parser.add_argument("--updates", type=int, default=None)
+    parser.add_argument("--init_ckpt", type=str, default=None, help="Optional init checkpoint from IL")
+    parser.add_argument("--eval_episodes", type=int, default=64)
+    parser.add_argument("--eval_num_envs", type=int, default=128)
     args = parser.parse_args()
 
     cfg, env_overrides = load_config(args.config)
@@ -180,6 +194,11 @@ def main():
     dummy = vec.reset()
     in_channels = dummy["obs"].shape[1]
     model = CNNPolicy(in_channels=in_channels).to(device)
+    if args.init_ckpt:
+        state = torch.load(args.init_ckpt, map_location=device)
+        if isinstance(state, dict) and "model" in state:
+            model.load_state_dict(state["model"])
+            log.info(f"Loaded init checkpoint from {args.init_ckpt}")
     opt = AdamW(model.parameters(), lr=cfg.lr)
     sched = CosineAnnealingLR(opt, T_max=cfg.total_updates)
     ppo_cfg = PPOConfig(
@@ -192,10 +211,17 @@ def main():
     )
 
     progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
+    per_update_rows = []
     for update in progress:
         vec.set_frontier_only_reveal(update < cfg.frontier_mask_until_updates)
+        # Constrain flags to frontier unknowns early (but don't disable)
+        try:
+            vec.set_flag_frontier_only(update < max(100, cfg.frontier_mask_until_updates))
+        except Exception:
+            pass
+        reveal_only_now = update < cfg.disable_flags_until_updates
         t0 = time.time()
-        buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device)
+        buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device, reveal_only=reveal_only_now)
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
         B = cfg.num_envs * cfg.steps_per_env
@@ -220,9 +246,78 @@ def main():
         steps_this_update = cfg.num_envs * cfg.steps_per_env
         log.info(f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | loss={loss_avg:.4f} pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f} | frontier={'on' if update < cfg.frontier_mask_until_updates else 'off'}")
 
+        per_update_rows.append({
+            "update": int(update + 1),
+            "seconds": float(dt),
+            "steps": int(steps_this_update),
+            "loss": float(loss_avg),
+            "policy_loss": float(pol_avg),
+            "value_loss": float(val_avg),
+            "entropy": float(ent_avg),
+        })
+
         if (update + 1) % 10 == 0:
             ckpt_path = os.path.join(args.out, f"ckpt_{update+1}.pt")
             torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_path)
+            # periodic eval history (quick reveal-only)
+            try:
+                m = evaluate_vec(
+                    model,
+                    env_cfg,
+                    episodes=min(32, args.eval_episodes),
+                    seed=0,
+                    num_envs=min(64, args.eval_num_envs),
+                    progress_every=0,
+                    reveal_only=True,
+                )
+                with open(os.path.join(args.out, "eval_history.jsonl"), "a") as f:
+                    rec = {"update": int(update + 1), **m}
+                    f.write(json.dumps(rec) + "\n")
+            except Exception as e:
+                log.warning(f"Periodic eval failed at update {update+1}: {e}")
+
+    # Export per-update CSV
+    try:
+        csv_path = os.path.join(args.out, "train_metrics.csv")
+        if per_update_rows:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(per_update_rows[0].keys()))
+                writer.writeheader(); writer.writerows(per_update_rows)
+            log.info(f"Wrote {csv_path}")
+    except Exception as e:
+        log.warning(f"Failed to write train_metrics.csv: {e}")
+
+    # Final checkpoint
+    final_ckpt = os.path.join(args.out, f"ckpt_{cfg.total_updates}.pt")
+    if os.path.exists(final_ckpt):
+        last_ckpt = final_ckpt
+    else:
+        # find last saved ckpt
+        import glob, re
+        paths = glob.glob(os.path.join(args.out, "ckpt_*.pt"))
+        if paths:
+            last_ckpt = max(paths, key=lambda p: int(re.search(r"ckpt_(\\d+)\\.pt$", os.path.basename(p)).group(1)))
+        else:
+            last_ckpt = None
+
+    # End-of-training evaluation (fast reveal-only + full with safeguards)
+    try:
+        eval_eps = int(max(8, args.eval_episodes))
+        eval_envs = int(min(args.eval_num_envs, eval_eps))
+        # Reveal-only
+        m_reveal = evaluate_vec(model, env_cfg, episodes=eval_eps, seed=0, num_envs=eval_envs, progress_every=0, reveal_only=True)
+        # Full with caps
+        m_full = evaluate_vec(model, env_cfg, episodes=eval_eps, seed=0, num_envs=eval_envs, progress_every=0, reveal_only=False, max_steps_per_episode=512, reveal_fallback_every=25)
+        summary = {
+            "checkpoint": os.path.basename(last_ckpt) if last_ckpt else None,
+            "reveal_only": m_reveal,
+            "full": m_full,
+        }
+        with open(os.path.join(args.out, "summary.json"), "w") as f:
+            json.dump(summary, f)
+        log.info(f"Wrote summary.json: {summary}")
+    except Exception as e:
+        log.warning(f"End-of-training eval failed: {e}")
 
 
 if __name__ == "__main__":

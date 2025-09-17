@@ -15,7 +15,13 @@ from minesweeper.models import CNNPolicy
 
 
 @torch.no_grad()
-def evaluate(model: CNNPolicy, env_cfg: EnvConfig, episodes: int = 1000, seed: int = 0) -> Dict[str, float]:
+def evaluate(
+    model: CNNPolicy,
+    env_cfg: EnvConfig,
+    episodes: int = 1000,
+    seed: int = 0,
+    reveal_only: bool = False,
+) -> Dict[str, float]:
     device = next(model.parameters()).device
     rng = np.random.default_rng(seed)
     wins = 0
@@ -30,9 +36,10 @@ def evaluate(model: CNNPolicy, env_cfg: EnvConfig, episodes: int = 1000, seed: i
         while not done:
             obs = torch.from_numpy(d["obs"][None]).to(device=device, dtype=torch.float32)
             mask = torch.from_numpy(d["action_mask"][None]).to(device=device, dtype=torch.bool)
-            # Evaluate with reveals only to ensure episode terminates
-            half = mask.shape[-1] // 2
-            mask[:, half:] = False
+            if reveal_only:
+                # Force reveal-only actions
+                half = mask.shape[-1] // 2
+                mask[:, half:] = False
             logits, _ = model(obs)
             masked_logits = logits.masked_fill(~mask, -1e9)
             action = masked_logits.argmax(dim=-1).item()
@@ -65,6 +72,9 @@ def evaluate_vec(
     num_envs: int = 256,
     progress_every: int = 0,
     print_fn: Optional[Callable[[str], None]] = None,
+    reveal_only: bool = False,
+    max_steps_per_episode: int = 512,
+    reveal_fallback_every: int = 0,
 ) -> Dict[str, float]:
     device = next(model.parameters()).device
     vec = VecMinesweeper(num_envs=num_envs, cfg=env_cfg, seed=seed)
@@ -93,9 +103,9 @@ def evaluate_vec(
         while finished < batch_size:
             obs = torch.from_numpy(d["obs"]).to(device=device, dtype=torch.float32)
             mask = torch.from_numpy(d["action_mask"]).to(device=device, dtype=torch.bool)
-            # Evaluate with reveals only
-            half = mask.shape[-1] // 2
-            mask[:, half:] = False
+            if reveal_only or (reveal_fallback_every and (tick % reveal_fallback_every == 0)):
+                half = mask.shape[-1] // 2
+                mask[:, half:] = False
             logits, _ = model(obs)
             masked_logits = logits.masked_fill(~mask, -1e9)
             actions = masked_logits.argmax(dim=-1).cpu().numpy().astype(np.int32)
@@ -107,6 +117,12 @@ def evaluate_vec(
                     outcome = outcomes[i]
                     if outcome == "win":
                         wins += 1
+                    total_steps += int(step_counters[i])
+                    step_counters[i] = 0
+                    counted[i] = True
+                    finished += 1
+                # force-finish overly long episodes
+                if not counted[i] and max_steps_per_episode > 0 and step_counters[i] >= max_steps_per_episode:
                     total_steps += int(step_counters[i])
                     step_counters[i] = 0
                     counted[i] = True
@@ -143,17 +159,24 @@ def _load_latest_checkpoint(run_dir: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a Minesweeper RL checkpoint")
-    parser.add_argument("--run_dir", type=str, required=True, help="Directory with ckpt_*.pt files")
+    parser.add_argument("--run_dir", type=str, default=None, help="Directory with ckpt_*.pt files")
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to a specific checkpoint (.pt)")
     parser.add_argument("--episodes", type=int, default=64)
     parser.add_argument("--config", type=str, required=True, help="YAML config path (to build EnvConfig)")
     parser.add_argument("--num_envs", type=int, default=128)
     parser.add_argument("--progress", action="store_true", help="Print evaluation progress")
+    parser.add_argument("--reveal_only", action="store_true", help="Restrict eval actions to reveals only")
     args = parser.parse_args()
 
     import yaml
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt_path = _load_latest_checkpoint(args.run_dir)
+    if args.ckpt:
+        ckpt_path = args.ckpt
+    else:
+        if not args.run_dir:
+            raise SystemExit("Provide either --ckpt or --run_dir")
+        ckpt_path = _load_latest_checkpoint(args.run_dir)
     state = torch.load(ckpt_path, map_location=device)
 
     # Build model
@@ -175,6 +198,7 @@ def main():
         seed=0,
         num_envs=min(args.num_envs, args.episodes),
         progress_every=(max(1, args.episodes // 4) if args.progress else 0),
+        reveal_only=args.reveal_only,
     )
 
     summary = {"checkpoint": os.path.basename(ckpt_path), **metrics}

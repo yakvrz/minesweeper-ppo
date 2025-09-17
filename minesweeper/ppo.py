@@ -5,6 +5,7 @@ from typing import Dict
 
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 
 @dataclass
@@ -18,12 +19,19 @@ class PPOConfig:
 
 
 def ppo_update(model, optimizer, batch, cfg: PPOConfig) -> Dict[str, float]:
-    if cfg.aux_mine_weight > 0:
-        logits, value, mine_logits = model(batch.obs, return_mine=True)
-    else:
-        logits, value = model(batch.obs, return_mine=False)
-        mine_logits = None
-    masked_logits = logits.masked_fill(~batch.action_mask, -1e9)
+    use_cuda = batch.obs.is_cuda
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
+    with autocast_ctx:
+        if cfg.aux_mine_weight > 0:
+            logits, value, mine_logits = model(batch.obs, return_mine=True)
+        else:
+            logits, value = model(batch.obs, return_mine=False)
+            mine_logits = None
+    # Choose masking constant safe for dtype
+    neg_inf = -1e9
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        neg_inf = -1e4
+    masked_logits = logits.masked_fill(~batch.action_mask, neg_inf)
 
     logp = F.log_softmax(masked_logits, dim=-1)
     logp_act = logp.gather(1, batch.actions.unsqueeze(1)).squeeze(1)

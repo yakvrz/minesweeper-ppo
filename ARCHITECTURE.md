@@ -131,7 +131,8 @@ masked_logits = logits.masked_fill(~action_mask, -1e9)
   * `-1e-4` per step.
 * **Flag shaping** (optional):
 
-  * `+0.002` correct mine flag; `-0.002` incorrect flag.
+  * Simple: `+0.002` correct mine flag; `-0.002` incorrect flag.
+  * Potential-based (policy-invariant): shaping over TP/FP flags with `alpha_flag`, plus toggle cost.
 * **Invalid actions** (should be rare with masking):
 
   * `-0.001`, no state change.
@@ -277,6 +278,7 @@ class CNNPolicy(nn.Module):
 * Mean fraction of safe cells revealed
 * Steps to win/loss
 * % invalid actions (should → \~0)
+* Flag metrics: TP/FP counts, toggle rate, precision (optional)
 * Reward components breakdown
 * Baselines:
 
