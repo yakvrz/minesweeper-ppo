@@ -12,9 +12,10 @@ env:
   alpha_flag: 0.002
   flag_toggle_cost: 0.001
   chord_enabled: true
-  stagnation_cap_factor: 3
-  stagnation_penalty: 0.01
+  stagnation_cap_factor: 1
+  stagnation_penalty: 0.05
   enforce_flag_budget: true
+  holding_tax_per_flag: 0.0001
 
 ppo:
   num_envs: 128
@@ -25,7 +26,7 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.01
+  ent_coef: 0.0015
   lr: 0.0003
   max_grad_norm: 0.5
   aux_mine_weight: 0.1

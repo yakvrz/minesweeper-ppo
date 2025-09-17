@@ -196,6 +196,11 @@ def main():
     dummy = vec.reset()
     in_channels = dummy["obs"].shape[1]
     model = CNNPolicy(in_channels=in_channels).to(device)
+    # Bias the flag head down initially to prevent early flag dominance
+    try:
+        model.bias_flag_down(bias_delta=-1.5)
+    except Exception:
+        pass
     if args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location=device)
         if isinstance(state, dict) and "model" in state:

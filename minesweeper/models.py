@@ -33,4 +33,15 @@ class CNNPolicy(nn.Module):
             return policy_logits, value, mine_logits
         return policy_logits, value
 
+    def bias_flag_down(self, bias_delta: float = -1.5):
+        """Bias the flag logit channel downward at init to curb early flag spam.
+        Expects policy_head with out_channels=2: [reveal, flag].
+        """
+        with torch.no_grad():
+            if isinstance(self.policy_head, nn.Conv2d) and self.policy_head.out_channels == 2:
+                # weight unaffected; adjust bias second channel
+                if self.policy_head.bias is None:
+                    self.policy_head.bias = nn.Parameter(torch.zeros(2, dtype=self.policy_head.weight.dtype, device=self.policy_head.weight.device))
+                self.policy_head.bias[1] += bias_delta
+
 

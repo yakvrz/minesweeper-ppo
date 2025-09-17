@@ -31,6 +31,7 @@ class EnvConfig:
     stagnation_cap_factor: int = 0  # end if no new reveals for factor * H * W steps; 0 disables
     stagnation_penalty: float = 0.0  # penalty when ending due to stagnation
     enforce_flag_budget: bool = False  # prevent new flags if budget (mine_count) reached
+    holding_tax_per_flag: float = 0.0  # per-step small penalty per active flag
 
 
 class MinesweeperEnv:
@@ -165,6 +166,10 @@ class MinesweeperEnv:
             toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
             if toggles > 0:
                 reward += -float(self.cfg.flag_toggle_cost) * float(toggles)
+
+        # Holding tax: penalize carrying many flags (tiny only recommended)
+        if self.cfg.holding_tax_per_flag > 0.0:
+            reward += -float(self.cfg.holding_tax_per_flag) * float(int(self.flags.sum()))
 
         # Stagnation cap
         if self._last_new_reveals > 0:
