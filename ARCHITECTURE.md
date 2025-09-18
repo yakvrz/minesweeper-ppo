@@ -84,7 +84,7 @@ Vectorized wrapper `VecMinesweeper` batches N environments on CPU and provides `
 Default channels, shape `(C, H, W)`:
 
 1. `revealed` – {0,1}
-2. `flags` – {0,1}
+2. `flags` – {0,1} (auto-maintained by the environment’s deduction loop; the agent never issues flag actions)
 3. `adjacent_counts_onehot` – 9 channels for values 0..8; *only* active where `revealed=1`, else all-zero.
 
 Optional fast-learning helpers (can be toggled later):
@@ -96,20 +96,12 @@ Optional fast-learning helpers (can be toggled later):
 
 ## Action Space & Masking
 
-* Discrete size `A = 2 * H * W`.
-* Index mapping:
+* Discrete size `A = H * W` – **reveal actions only**.
+* Index mapping: `cell = idx % (H*W)` with `(r, c)` derived from the flat index.
 
-  * `cell = idx % (H*W)`
-  * `r = cell // W`, `c = cell % W`
-  * `is_flag = (idx >= H*W)`
+**Mask rule**: mask out any cell that is already revealed. All remaining unknown cells are legal actions.
 
-**Mask rules** (bool mask length `A`):
-
-* For **reveal** actions: mask out if `revealed[r,c]` is True.
-* For **flag** actions: mask out if `revealed[r,c]` is True.
-* (Curriculum option) During early training, mask reveal actions to **frontier cells only** to reduce pure guessing. Later, relax.
-
-**Implementation tip**: Convert mask to `-inf` before softmax:
+**Implementation tip**: convert masked logits to `-inf` before the softmax:
 
 ```python
 masked_logits = logits.masked_fill(~action_mask, -1e9)
@@ -125,17 +117,8 @@ masked_logits = logits.masked_fill(~action_mask, -1e9)
   * Loss: `-1.0`
 * **Progress shaping**:
 
-  * `+k` per *new* safe cell revealed in current step (`k ≈ 0.01`); cascade yields a bigger single-step reward.
-* **Step penalty**:
-
-  * `-1e-4` per step.
-* **Flag shaping** (optional):
-
-  * Simple: `+0.002` correct mine flag; `-0.002` incorrect flag.
-  * Potential-based (policy-invariant): shaping over TP/FP flags with `alpha_flag`, plus toggle cost.
-* **Invalid actions** (should be rare with masking):
-
-  * `-0.001`, no state change.
+  * `+ (new_safe / (H * W))` per step, where `new_safe` is the number of freshly revealed safe cells after the closure cascade.
+* No additional step penalties or flag shaping – the environment manages flags automatically during the closure.
 
 ---
 
@@ -194,7 +177,7 @@ class CNNPolicy(nn.Module):
             nn.GroupNorm(8, 64),
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
         )
-        self.policy_head = nn.Conv2d(64, 2, 1)  # (reveal, flag) per cell
+        self.policy_head = nn.Conv2d(64, 1, 1)  # reveal logit per cell
         self.value_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1), nn.Flatten(),
             nn.Linear(64, 64), nn.ReLU(),
@@ -321,12 +304,6 @@ env:
   W: 8
   mine_count: 10
   guarantee_safe_neighborhood: true
-  progress_reward: 0.01
-  win_reward: 1.0
-  loss_reward: -1.0
-  step_penalty: 0.0001
-  invalid_penalty: 0.001
-  use_flag_shaping: false
 
 ppo:
   num_envs: 256
@@ -341,7 +318,6 @@ ppo:
   lr: 0.0003
   max_grad_norm: 0.5
   aux_mine_weight: 0.1
-  frontier_mask_until_updates: 200  # curriculum switch
 ```
 
 ---
@@ -350,7 +326,7 @@ ppo:
 
 * **First click safety**: mines placed after first reveal; optionally exclude 8-neighborhood.
 * **Flood-fill correctness**: BFS over zero cells; ensure reward counts *unique* newly revealed safe cells.
-* **Flags on revealed cells**: invalid (masked + penalty if executed).
+* **Auto flags**: deduction loop marks provable mines internally; policy never issues flag actions.
 * **Done transitions**: clamp reward to terminal outcome + last step’s progress reward in same tick (documented behavior).
 * **Determinism (later)**: seed PyTorch/NumPy and freeze CuDNN for exactness when needed.
 

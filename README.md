@@ -10,38 +10,23 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 - PPO training: `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
 - Evaluate latest checkpoint: `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
 
-## Flag-aware training (tiny example)
+## Reveal-only training (tiny example)
 
-- Tiny IL (6×6×6): `python train_il.py --out runs/il_tiny --samples 500000 --batch 256 --aux 0.1 --H 6 --W 6 --mines 6`
-- Tiny PPO with flags + shaping: `python train_rl.py --config configs/tiny_6x6_6.yaml --out runs/ppo_tiny_flags --updates 200 --init_ckpt runs/il_tiny/il_final.pt`
+- Tiny PPO: `python train_rl.py --config configs/tiny_6x6_6.yaml --out runs/tiny_reveal --updates 200`
+- Optional fast smoke run: `python train_rl.py --config configs/smoke.yaml --out runs/smoke --updates 40`
 
-The tiny config enables:
-- Potential-based flag shaping (`alpha_flag`, `flag_toggle_cost`)
-- Chord (auto-reveal when flags match numbers)
-- Early constraint: flags masked to frontier unknowns
-- Stagnation cap to end stalled episodes
+The environment now auto-applies all provable deductions after each reveal (flags + safe reveals + chord). Rewards are:
 
-## Current recommended tiny run (fresh)
+- `+1 / -1` on win/loss
+- `+(new_safe / (H×W))` per step for newly revealed safe cells
 
-- Fresh PPO from scratch with flags+chord and lighter anti-dither:
-  - `python -u train_rl.py --config configs/tiny_6x6_6.yaml --out runs/ppo_tiny_fresh --updates 300`
-  - At the end, see `runs/ppo_tiny_fresh/summary.json` (full and reveal-only), `train_metrics.csv`.
-
-## Key knobs (EnvConfig)
-
-- `alpha_flag` (float): potential shaping weight over TP−FP flags.
-- `flag_toggle_cost` (float): per-step penalty per flag change.
-- `holding_tax_per_flag` (float): tiny per-flag tax per step (use sparingly; tiny only).
-- `chord_enabled` (bool): auto-reveal neighbors when flags match number.
-- `stagnation_cap_factor`, `stagnation_penalty`: terminates episodes with no progress.
-- `enforce_flag_budget` (bool): cap flags to `mine_count`.
+No explicit flag actions or penalties remain—the agent purely learns where to reveal.
 
 ## Metrics to monitor
 
-- Full-mode win_rate (primary), avg_steps.
-- Flag precision = TP / max(1, TP+FP).
-- Toggle rate (toggles/step), longest no-progress span, avg new reveals/step.
-- Reveal-only win_rate (as ablation), not the primary gate once flags are trained.
+- Full-mode win_rate (primary) and average steps.
+- Average normalized progress (`avg_progress` in evaluation output).
+- Reveal-only win_rate as a sanity check (pure reveal performance).
 
 ## Layout
 

@@ -44,12 +44,12 @@ class PPOTrainConfig:
     clip_eps_v: float = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.003
+    ent_coef_min: float = 0.003
+    ent_decay_updates: int = 0
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     aux_mine_weight: float = 0.0
-    frontier_mask_until_updates: int = 200
     total_updates: int = 1000
-    disable_flags_until_updates: int = 0
 
 
 def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
@@ -75,12 +75,12 @@ def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
         clip_eps_v=ppo_d.get("clip_eps_v", base.clip_eps_v),
         vf_coef=ppo_d.get("vf_coef", base.vf_coef),
         ent_coef=ppo_d.get("ent_coef", base.ent_coef),
+        ent_coef_min=ppo_d.get("ent_coef_min", base.ent_coef_min),
+        ent_decay_updates=ppo_d.get("ent_decay_updates", base.ent_decay_updates),
         lr=ppo_d.get("lr", base.lr),
         max_grad_norm=ppo_d.get("max_grad_norm", base.max_grad_norm),
         aux_mine_weight=ppo_d.get("aux_mine_weight", base.aux_mine_weight),
-        frontier_mask_until_updates=ppo_d.get("frontier_mask_until_updates", base.frontier_mask_until_updates),
         total_updates=ppo_d.get("total_updates", base.total_updates),
-        disable_flags_until_updates=ppo_d.get("disable_flags_until_updates", base.disable_flags_until_updates),
     )
     return cfg, env_d
 
@@ -94,58 +94,51 @@ def _forward_policy(model: nn.Module, obs: torch.Tensor, mask: torch.Tensor) -> 
     return {"logits": masked_logits, "logp": logp, "probs": probs, "value": value}
 
 
-def collect_rollout(vec: VecMinesweeper, model: nn.Module, steps: int, device: torch.device, reveal_only: bool = False) -> tuple[RolloutBuffer, Dict]:
-    vec_batch = vec.reset()
-    N = vec_batch["obs"].shape[0]
-    C, H, W = vec_batch["obs"].shape[1:]
-    A = vec_batch["action_mask"].shape[1]
+def collect_rollout(
+    vec: VecMinesweeper,
+    model: nn.Module,
+    steps: int,
+    device: torch.device,
+) -> tuple[RolloutBuffer, Dict]:
+    batch = vec.reset()
+    obs_np = batch["obs"]
+    mask_np = batch["action_mask"]
+    num_envs = obs_np.shape[0]
+    C, H, W = obs_np.shape[1:]
+    action_dim = mask_np.shape[1]
 
-    buffer = RolloutBuffer(num_envs=N, steps=steps, obs_shape=(C, H, W), action_dim=A, device=device)
+    buffer = RolloutBuffer(num_envs=num_envs, steps=steps, obs_shape=(C, H, W), action_dim=action_dim, device=device)
 
-    obs_np = vec_batch["obs"]
-    mask_np = vec_batch["action_mask"]
-
-    for t in range(steps):
+    for _ in range(steps):
         obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
         mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
-        if reveal_only:
-            half = mask.shape[-1] // 2
-            mask[:, half:] = False
-
-        out = _forward_policy(model, obs, mask)
-        probs = out["probs"]
-        dist = torch.distributions.Categorical(probs=probs)
+        logits, values = model(obs)
+        logits = logits.masked_fill(~mask, -1e9)
+        dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
         logp = dist.log_prob(actions)
-        values = out["value"]
 
-        # prepare auxiliary mine labels from current env states (optional)
-        mine_labels_np = []
-        for e in vec.envs:
-            if getattr(e, "first_click_done", False):
-                mine_labels_np.append(e.mine_mask.astype(np.float32))
-            else:
-                mine_labels_np.append(np.zeros((e.H, e.W), dtype=np.float32))
-        mine_labels = torch.from_numpy(np.stack(mine_labels_np, axis=0)).to(device=device, dtype=torch.float32)
-
-        # step env
-        actions_np = actions.detach().cpu().numpy().astype(np.int32)
+        # no auxiliary mine labels needed in reveal-only setup
+        actions_np = actions.cpu().numpy().astype(np.int32)
         batch, rewards_np, dones_np, infos = vec.step(actions_np)
 
-        # add to buffer
         rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
         dones = torch.from_numpy(dones_np).to(device=device, dtype=torch.bool)
-        buffer.add(obs, mask, actions, logp, rewards, dones, values, mine_labels=mine_labels)
+        buffer.add(
+            obs.detach(),
+            mask.detach(),
+            actions.detach(),
+            logp.detach(),
+            rewards,
+            dones,
+            values.detach(),
+        )
 
         obs_np = batch["obs"]
         mask_np = batch["action_mask"]
 
-    # bootstrap value
     obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
     mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
-    if reveal_only:
-        half = mask.shape[-1] // 2
-        mask[:, half:] = False
     with torch.no_grad():
         _, last_values = model(obs)
     return buffer, {"last_values": last_values}
@@ -177,31 +170,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    env_cfg = EnvConfig(
-        H=cfg.H,
-        W=cfg.W,
-        mine_count=cfg.mine_count,
-        guarantee_safe_neighborhood=cfg.guarantee_safe_neighborhood,
-        progress_reward=env_overrides.get("progress_reward", EnvConfig().progress_reward),
-        win_reward=env_overrides.get("win_reward", EnvConfig().win_reward),
-        loss_reward=env_overrides.get("loss_reward", EnvConfig().loss_reward),
-        step_penalty=env_overrides.get("step_penalty", EnvConfig().step_penalty),
-        invalid_penalty=env_overrides.get("invalid_penalty", EnvConfig().invalid_penalty),
-        flag_correct_reward=env_overrides.get("flag_correct_reward", EnvConfig().flag_correct_reward),
-        flag_incorrect_reward=env_overrides.get("flag_incorrect_reward", EnvConfig().flag_incorrect_reward),
-        use_flag_shaping=env_overrides.get("use_flag_shaping", EnvConfig().use_flag_shaping),
-    )
+    env_kwargs = {
+        "H": cfg.H,
+        "W": cfg.W,
+        "mine_count": cfg.mine_count,
+        "guarantee_safe_neighborhood": cfg.guarantee_safe_neighborhood,
+    }
+    env_kwargs.update(env_overrides)
+    env_cfg = EnvConfig(**env_kwargs)
     vec = VecMinesweeper(num_envs=cfg.num_envs, cfg=env_cfg, seed=args.seed)
 
     dummy = vec.reset()
     in_channels = dummy["obs"].shape[1]
     model = CNNPolicy(in_channels=in_channels).to(device)
-    # Bias the flag head down initially to prevent early flag dominance
-    # Flag bias schedule: start at -1.25 and relax toward 0 by update ~200 (implemented via per-update adjustments)
-    try:
-        model.bias_flag_down(bias_delta=-1.25)
-    except Exception:
-        pass
     if args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location=device)
         if isinstance(state, dict) and "model" in state:
@@ -222,24 +203,18 @@ def main():
     per_update_rows = []
     best_full_win = -1.0
     for update in progress:
-        vec.set_frontier_only_reveal(update < cfg.frontier_mask_until_updates)
-        # Constrain flags to frontier unknowns early (but don't disable)
-        try:
-            vec.set_flag_frontier_only(update < min(75, cfg.frontier_mask_until_updates))
-        except Exception:
-            pass
-        reveal_only_now = update < cfg.disable_flags_until_updates
-        # Relax flag bias linearly toward 0 over first 200 updates
-        try:
-            if update < 200:
-                # bias from -1.25 to 0
-                frac = (update + 1) / 200.0
-                current_bias = -1.25 * (1.0 - frac)
-                model.set_flag_bias(current_bias)
-        except Exception:
-            pass
+        # Entropy decay if configured
+        if cfg.ent_decay_updates > 0:
+            decay_steps = max(1, int(cfg.ent_decay_updates))
+            decay_frac = min(1.0, update / decay_steps)
+            current_ent_coef = float(
+                cfg.ent_coef + (cfg.ent_coef_min - cfg.ent_coef) * decay_frac
+            )
+        else:
+            current_ent_coef = float(cfg.ent_coef)
+        ppo_cfg.ent_coef = current_ent_coef
         t0 = time.time()
-        buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device, reveal_only=reveal_only_now)
+        buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device)
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
         B = cfg.num_envs * cfg.steps_per_env
@@ -262,7 +237,11 @@ def main():
             loss_avg = pol_avg = val_avg = ent_avg = float('nan')
 
         steps_this_update = cfg.num_envs * cfg.steps_per_env
-        log.info(f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | loss={loss_avg:.4f} pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f} | frontier={'on' if update < cfg.frontier_mask_until_updates else 'off'}")
+        log.info(
+            f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | "
+            f"loss={loss_avg:.4f} pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f} "
+            f"ent_coef={current_ent_coef:.4f}"
+        )
 
         per_update_rows.append({
             "update": int(update + 1),
@@ -272,6 +251,7 @@ def main():
             "policy_loss": float(pol_avg),
             "value_loss": float(val_avg),
             "entropy": float(ent_avg),
+            "ent_coef": float(current_ent_coef),
         })
 
         # Save latest periodically (overwrite) and track best by quick full-mode eval
@@ -336,5 +316,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

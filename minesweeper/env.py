@@ -6,6 +6,8 @@ from typing import Any, Dict, Tuple, Optional
 import numpy as np
 from collections import deque
 
+from .rules import forced_moves
+
 
 @dataclass
 class EnvConfig:
@@ -14,24 +16,8 @@ class EnvConfig:
     mine_count: int = 10
     guarantee_safe_neighborhood: bool = True
 
-    progress_reward: float = 0.01
     win_reward: float = 1.0
     loss_reward: float = -1.0
-    step_penalty: float = 1e-4
-    invalid_penalty: float = 1e-3
-
-    flag_correct_reward: float = 0.002
-    flag_incorrect_reward: float = -0.002
-    use_flag_shaping: bool = False
-    # Flag shaping and behavior controls
-    alpha_flag: float = 0.0  # potential-based shaping weight (A). 0 disables
-    flag_toggle_cost: float = 0.0  # per-toggle penalty to reduce flip-flop
-    shaping_gamma: float = 0.995  # discount for potential-based shaping
-    chord_enabled: bool = True  # enable auto-chord reveals (B)
-    stagnation_cap_factor: int = 0  # end if no new reveals for factor * H * W steps; 0 disables
-    stagnation_penalty: float = 0.0  # penalty when ending due to stagnation
-    enforce_flag_budget: bool = False  # prevent new flags if budget (mine_count) reached
-    holding_tax_per_flag: float = 0.0  # per-step small penalty per active flag
 
 
 class MinesweeperEnv:
@@ -47,7 +33,7 @@ class MinesweeperEnv:
         self.cfg = cfg
         self.H = int(cfg.H)
         self.W = int(cfg.W)
-        self.A = 2 * self.H * self.W
+        self.A = self.H * self.W
 
         self.rng = np.random.default_rng(seed)
 
@@ -60,10 +46,6 @@ class MinesweeperEnv:
         self.step_count: int
         self._last_new_reveals: int = 0
 
-        # Optional curriculum toggle: restrict reveal actions to frontier
-        self.frontier_only_reveal: bool = False
-        self.flag_frontier_only: bool = False
-
         self.reset()
 
     # ------------------------ Public API ------------------------
@@ -72,12 +54,10 @@ class MinesweeperEnv:
         self.adjacent_counts = np.zeros((self.H, self.W), dtype=np.uint8)
         self.revealed = np.zeros((self.H, self.W), dtype=bool)
         self.flags = np.zeros((self.H, self.W), dtype=bool)
-        self.flags_prev = self.flags.copy()
         self.first_click_done = False
         self.step_count = 0
         self._last_new_reveals = 0
-        self.steps_since_progress = 0
-        self._last_toggles = 0
+        self.total_new_reveals = 0.0
 
         return {
             "obs": self._build_obs(),
@@ -89,110 +69,44 @@ class MinesweeperEnv:
         action = int(action)
         cell = action % (self.H * self.W)
         r, c = divmod(cell, self.W)
-        is_flag = action >= (self.H * self.W)
 
         reward = 0.0
         done = False
         info: Dict[str, Any] = {}
         outcome: Optional[str] = None
+        self._last_new_reveals = 0
 
-        # Keep previous flags for shaping and toggle cost
-        prev_flags = self.flags.copy()
+        total_cells = self.H * self.W
+        total_safe = total_cells - int(self.cfg.mine_count)
 
-        # Invalid: cannot act on revealed cells
-        if self.revealed[r, c]:
-            reward += -float(self.cfg.invalid_penalty)
-            # no state change
-        else:
-            if is_flag:
-                # toggle flag on unrevealed cell
-                before = bool(self.flags[r, c])
-                self.flags[r, c] = ~before
-                # optional shaping only after mines exist
-                if self.cfg.use_flag_shaping and self.first_click_done:
-                    now_flagged = bool(self.flags[r, c])
-                    if now_flagged:
-                        # added a flag
-                        if self.mine_mask[r, c]:
-                            reward += float(self.cfg.flag_correct_reward)
-                        else:
-                            reward += -float(self.cfg.flag_incorrect_reward)
-                    else:
-                        # removed a flag: no reward
-                        pass
+        if not self.revealed[r, c]:
+            if not self.first_click_done:
+                self._place_mines_safe(first_click_rc=(r, c))
+                self.first_click_done = True
+
+            if self.mine_mask[r, c]:
+                self.revealed[r, c] = True
+                done = True
+                outcome = "loss"
+                reward += float(self.cfg.loss_reward)
             else:
-                # reveal
-                if not self.first_click_done:
-                    self._place_mines_safe(first_click_rc=(r, c))
-                    self.first_click_done = True
-
-                if self.mine_mask[r, c]:
-                    # terminal loss
-                    self.revealed[r, c] = True
-                    reward += float(self.cfg.loss_reward)
+                newly_revealed = self._reveal_with_flood_fill(r, c)
+                deductions_revealed, _ = self._apply_deductions()
+                total_new = newly_revealed + deductions_revealed
+                self._last_new_reveals = total_new
+                self.total_new_reveals += float(total_new)
+                reward += float(total_new) / float(total_cells)
+                if int(self.revealed.sum()) >= total_safe:
                     done = True
-                    outcome = "loss"
-                else:
-                    newly_revealed = self._reveal_with_flood_fill(r, c)
-                    # shaping by number of newly revealed safe cells
-                    reward += float(self.cfg.progress_reward) * float(newly_revealed)
-                    self._last_new_reveals = newly_revealed
-
-                    # win condition: all safe cells revealed
-                    total_safe = self.H * self.W - int(self.cfg.mine_count)
-                    if int(self.revealed.sum()) >= total_safe:
-                        reward += float(self.cfg.win_reward)
-                        done = True
-                        outcome = "win"
-
-        # Auto-chord mechanic (B)
-        if not done and self.first_click_done and self.cfg.chord_enabled:
-            chord_new = self._maybe_auto_chord()
-            if chord_new > 0:
-                reward += float(self.cfg.progress_reward) * float(chord_new)
-                self._last_new_reveals += chord_new
-
-        # Potential-based shaping over flags (A)
-        if self.first_click_done and self.cfg.alpha_flag > 0.0:
-            tp_prev = int((prev_flags & self.mine_mask).sum())
-            fp_prev = int((prev_flags & (~self.mine_mask)).sum())
-            tp_now = int((self.flags & self.mine_mask).sum())
-            fp_now = int((self.flags & (~self.mine_mask)).sum())
-            phi_prev = float(self.cfg.alpha_flag) * float(tp_prev - fp_prev)
-            phi_now = float(self.cfg.alpha_flag) * float(tp_now - fp_now)
-            reward += float(self.cfg.shaping_gamma) * phi_now - phi_prev
-
-        # Toggle cost
-        if self.cfg.flag_toggle_cost > 0.0:
-            toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
-            self._last_toggles = toggles
-            if toggles > 0:
-                reward += -float(self.cfg.flag_toggle_cost) * float(toggles)
+                    outcome = "win"
+                    reward += float(self.cfg.win_reward)
         else:
-            self._last_toggles = int((prev_flags.astype(np.int8) ^ self.flags.astype(np.int8)).sum())
+            # Invalid action (already revealed) -> no reward change, episode continues
+            pass
 
-        # Holding tax: penalize carrying many flags (tiny only recommended)
-        if self.cfg.holding_tax_per_flag > 0.0:
-            reward += -float(self.cfg.holding_tax_per_flag) * float(int(self.flags.sum()))
-
-        # Stagnation cap
-        if self._last_new_reveals > 0:
-            self.steps_since_progress = 0
-        else:
-            self.steps_since_progress += 1
-        cap_steps = int(self.cfg.stagnation_cap_factor) * self.H * self.W
-        if not done and cap_steps > 0 and self.steps_since_progress >= cap_steps:
-            if self.cfg.stagnation_penalty > 0.0:
-                reward += -float(self.cfg.stagnation_penalty)
-            done = True
-            outcome = outcome or "stagnation"
-
-        # step penalty always applied
-        reward += -float(self.cfg.step_penalty)
         self.step_count += 1
 
-        if done:
-            info["outcome"] = outcome
+        info["outcome"] = outcome
 
         obs_dict = {
             "obs": self._build_obs(),
@@ -212,27 +126,12 @@ class MinesweeperEnv:
 
     # ------------------------ Internal helpers ------------------------
     def _build_aux(self) -> Dict[str, Any]:
-        if not self.first_click_done:
-            remaining_mines_ratio = 1.0
-        else:
-            # Estimate remaining mines as total_mines - flagged_true (not perfect but informative)
-            total_mines = int(self.cfg.mine_count)
-            flagged = int((self.flags & self.mine_mask).sum())
-            remaining_mines = max(0, total_mines - flagged)
-            remaining_mines_ratio = remaining_mines / max(1, total_mines)
-        tp_flags = int((self.flags & self.mine_mask).sum()) if self.first_click_done else 0
-        fp_flags = int((self.flags & (~self.mine_mask)).sum()) if self.first_click_done else 0
         total_cells = self.H * self.W
         revealed_frac = float(int(self.revealed.sum()) / max(1, total_cells))
         return {
             "step": int(self.step_count),
             "last_new_reveals": int(self._last_new_reveals),
-            "remaining_mines_ratio": float(remaining_mines_ratio),
             "revealed_frac": revealed_frac,
-            "toggles": int(self._last_toggles),
-            "tp_flags": int(tp_flags),
-            "fp_flags": int(fp_flags),
-            "stagnation_steps": int(self.steps_since_progress),
         }
 
     def _build_obs(self) -> np.ndarray:
@@ -258,53 +157,9 @@ class MinesweeperEnv:
         return obs.astype(np.float32, copy=False)
 
     def _compute_action_mask(self) -> np.ndarray:
-        # Reveal valid on unrevealed cells (optionally frontier-only)
+        # Only unrevealed cells are valid actions
         unrevealed = ~self.revealed
-
-        if self.frontier_only_reveal and self.first_click_done:
-            frontier = self._compute_frontier()
-            reveal_valid = unrevealed & frontier
-            # If no frontier exists (early or trivial board), fall back to any unrevealed
-            if not reveal_valid.any():
-                reveal_valid = unrevealed
-        else:
-            reveal_valid = unrevealed
-
-        # Flag validity rules: allow removing any flagged-unrevealed; allow adding where permitted
-        flagged_unrevealed = unrevealed & self.flags
-        can_add = unrevealed & (~self.flags)
-        if self.flag_frontier_only and self.first_click_done:
-            frontier = self._compute_frontier()
-            can_add = can_add & frontier
-        if self.cfg.enforce_flag_budget and self.first_click_done:
-            if int(self.flags.sum()) >= int(self.cfg.mine_count):
-                can_add = np.zeros_like(can_add)
-        flag_valid = flagged_unrevealed | can_add
-
-        reveal_mask = reveal_valid.reshape(-1)
-        flag_mask = flag_valid.reshape(-1)
-        full_mask = np.concatenate([reveal_mask, flag_mask], axis=0)
-        return full_mask.astype(bool, copy=False)
-
-    def _compute_frontier(self) -> np.ndarray:
-        # Unknown cells adjacent to at least one revealed number
-        if not self.first_click_done:
-            return np.zeros((self.H, self.W), dtype=bool)
-        # cells with revealed numbers
-        number_cells = self.revealed & (self.adjacent_counts > 0)
-        if not number_cells.any():
-            return np.zeros((self.H, self.W), dtype=bool)
-        frontier = np.zeros((self.H, self.W), dtype=bool)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                shifted = self._shift_bool(number_cells, dr, dc)
-                frontier |= shifted
-        # unknown = not revealed and not flagged
-        unknown = (~self.revealed) & (~self.flags)
-        frontier &= unknown
-        return frontier
+        return unrevealed.reshape(-1).astype(bool, copy=False)
 
     def _reveal_with_flood_fill(self, r: int, c: int) -> int:
         """Reveal cell (r,c). If zero, BFS flood-fill reveals connected zero region
@@ -335,11 +190,12 @@ class MinesweeperEnv:
                             q.append((nr, nc))
         return newly_revealed
 
-    def _maybe_auto_chord(self) -> int:
+    def _maybe_auto_chord(self) -> Tuple[int, int]:
         """If a revealed number cell has adjacent flags equal to its number,
         auto-reveal its other unrevealed, unflagged neighbors. Returns count of newly revealed.
         """
         total_new = 0
+        events = 0
         number_cells = np.argwhere(self.revealed & (self.adjacent_counts > 0))
         for rr, cc in number_cells:
             num = int(self.adjacent_counts[rr, cc])
@@ -352,9 +208,39 @@ class MinesweeperEnv:
                 if (not self.flags[nr, nc]) and (not self.revealed[nr, nc]) and (not self.mine_mask[nr, nc]):
                     to_reveal.append((nr, nc))
             if flag_cnt == num and len(to_reveal) > 0:
+                events += 1
                 for tr, tc in to_reveal:
                     total_new += self._reveal_with_flood_fill(tr, tc)
-        return total_new
+        return total_new, events
+
+    def _apply_deductions(self) -> Tuple[int, int]:
+        if not self.first_click_done:
+            return 0, 0
+        total_revealed = 0
+        total_flagged = 0
+        while True:
+            progress = False
+            moves = forced_moves(self)
+            for act_type, idx in moves:
+                r, c = divmod(idx, self.W)
+                if act_type == "flag":
+                    if not self.flags[r, c]:
+                        self.flags[r, c] = True
+                        total_flagged += 1
+                        progress = True
+                else:  # reveal
+                    if not self.revealed[r, c] and not self.flags[r, c]:
+                        if self.mine_mask[r, c]:
+                            continue
+                        total_revealed += self._reveal_with_flood_fill(r, c)
+                        progress = True
+            chord_new, chord_events = self._maybe_auto_chord()
+            if chord_new > 0:
+                total_revealed += chord_new
+                progress = True
+            if not progress:
+                break
+        return total_revealed, total_flagged
 
     def _place_mines_safe(self, first_click_rc: Tuple[int, int]) -> None:
         r0, c0 = first_click_rc
@@ -430,27 +316,15 @@ class MinesweeperEnv:
 
 
 class VecMinesweeper:
-    """Batched wrapper that keeps N independent envs on CPU.
-
-    The API mirrors a standard vectorized env with NumPy arrays.
-    """
+    """Batched wrapper that keeps N independent envs on CPU."""
 
     def __init__(self, num_envs: int, cfg: EnvConfig, seed: int = 0):
         assert num_envs > 0
         self.cfg = cfg
         self.num_envs = int(num_envs)
-        # Derive different seeds to decorrelate
         base_rng = np.random.default_rng(seed)
         seeds = base_rng.integers(0, 2**31 - 1, size=self.num_envs, dtype=np.int64)
         self.envs = [MinesweeperEnv(cfg, int(seeds[i])) for i in range(self.num_envs)]
-
-    def set_frontier_only_reveal(self, enabled: bool) -> None:
-        for e in self.envs:
-            e.frontier_only_reveal = bool(enabled)
-
-    def set_flag_frontier_only(self, enabled: bool) -> None:
-        for e in self.envs:
-            e.flag_frontier_only = bool(enabled)
 
     def reset(self) -> Dict[str, np.ndarray]:
         obs_list = []
@@ -469,11 +343,16 @@ class VecMinesweeper:
         next_mask = []
         rewards = np.zeros((self.num_envs,), dtype=np.float32)
         dones = np.zeros((self.num_envs,), dtype=bool)
-        infos: Dict[str, Any] = {"aux": [], "outcome": []}
+        infos: Dict[str, Any] = {
+            "aux": [],
+            "outcome": [],
+            "done": [],
+        }
 
         for i, e in enumerate(self.envs):
             d_step, r, done, info_step = e.step(int(actions[i]))
             outcome = info_step.get("outcome") if done else None
+            aux_step = d_step.get("aux", {})
             # auto-reset done envs to streamline rollouts
             d = d_step
             if done:
@@ -482,8 +361,9 @@ class VecMinesweeper:
             next_mask.append(d["action_mask"])  # [A]
             rewards[i] = r
             dones[i] = done
-            infos["aux"].append(d.get("aux", {}))
+            infos["aux"].append(aux_step)
             infos["outcome"].append(outcome)
+            infos["done"].append(bool(done))
 
         batch = {
             "obs": np.stack(next_obs, axis=0),
@@ -496,5 +376,3 @@ class VecMinesweeper:
 
     def obs_channels(self) -> int:
         return self.envs[0].obs_channels
-
-
