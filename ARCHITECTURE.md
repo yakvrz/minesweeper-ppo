@@ -84,8 +84,10 @@ Vectorized wrapper `VecMinesweeper` batches N environments on CPU and provides `
 Default channels, shape `(C, H, W)`:
 
 1. `revealed` – {0,1}
-2. `flags` – {0,1} (auto-maintained by the environment’s deduction loop; the agent never issues flag actions)
+2. `flags` – {0,1} (optional, auto-maintained by the environment’s deduction loop; the agent never issues flag actions)
 3. `adjacent_counts_onehot` – 9 channels for values 0..8; *only* active where `revealed=1`, else all-zero.
+
+Optional helper planes (configurable): frontier mask, remaining mines ratio (broadcast), progress scalar (broadcast).
 
 Optional fast-learning helpers (can be toggled later):
 
@@ -117,8 +119,9 @@ masked_logits = logits.masked_fill(~action_mask, -1e9)
   * Loss: `-1.0`
 * **Progress shaping**:
 
-  * `+ (new_safe / (H * W))` per step, where `new_safe` is the number of freshly revealed safe cells after the closure cascade.
-* No additional step penalties or flag shaping – the environment manages flags automatically during the closure.
+  * `+ (progress_scale * new_safe / (H * W))` per step, where `new_safe` is the number of freshly revealed safe cells after the closure cascade.
+* **Step penalty**: small constant subtraction each move (default `1e-4`).
+* Flag shaping is removed—the environment manages flags automatically during the closure.
 
 ---
 
@@ -304,6 +307,8 @@ env:
   W: 8
   mine_count: 10
   guarantee_safe_neighborhood: true
+  step_penalty: 0.0001
+  progress_scale: 0.6
 
 ppo:
   num_envs: 256

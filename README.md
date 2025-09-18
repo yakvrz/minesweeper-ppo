@@ -18,9 +18,20 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 The environment now auto-applies all provable deductions after each reveal (flags + safe reveals + chord). Rewards are:
 
 - `+1 / -1` on win/loss
-- `+(new_safe / (H×W))` per step for newly revealed safe cells
+- `+(progress_scale * new_safe / (H×W))` per step for newly revealed safe cells
+- `-step_penalty` each step for mild efficiency pressure
 
 No explicit flag actions or penalties remain—the agent purely learns where to reveal.
+
+### Env config knobs
+
+- `step_penalty` (default `1e-4`)
+- `progress_scale` (default `0.6`)
+- Optional observation channels:
+  - `include_flags_channel`
+  - `include_frontier_channel`
+  - `include_remaining_mines_channel`
+  - `include_progress_channel`
 
 ## Metrics to monitor
 

@@ -18,15 +18,23 @@ class EnvConfig:
 
     win_reward: float = 1.0
     loss_reward: float = -1.0
+    step_penalty: float = 1e-4
+    progress_scale: float = 0.6
+
+    include_flags_channel: bool = False
+    include_frontier_channel: bool = False
+    include_remaining_mines_channel: bool = False
+    include_progress_channel: bool = False
 
 
 class MinesweeperEnv:
     """Single Minesweeper environment running on CPU with NumPy state.
 
-    Observation encoding (C,H,W):
-      0: revealed mask {0,1}
-      1: flags mask {0,1}
-      2..10: one-hot for adjacent count 0..8 (active only where revealed=1)
+    Observation encoding (C,H,W) is dynamic:
+      - revealed mask {0,1}
+      - optional flags mask {0,1} (if include_flags_channel)
+      - nine one-hot planes for adjacent counts 0..8 (active only where revealed=1)
+      - optional helper channels (frontier, remaining mines ratio, progress scalar)
     """
 
     def __init__(self, cfg: EnvConfig, seed: int = 0):
@@ -95,7 +103,7 @@ class MinesweeperEnv:
                 total_new = newly_revealed + deductions_revealed
                 self._last_new_reveals = total_new
                 self.total_new_reveals += float(total_new)
-                reward += float(total_new) / float(total_cells)
+                reward += float(self.cfg.progress_scale) * float(total_new) / float(total_cells)
                 if int(self.revealed.sum()) >= total_safe:
                     done = True
                     outcome = "win"
@@ -104,6 +112,7 @@ class MinesweeperEnv:
             # Invalid action (already revealed) -> no reward change, episode continues
             pass
 
+        reward -= float(self.cfg.step_penalty)
         self.step_count += 1
 
         info["outcome"] = outcome
@@ -132,28 +141,43 @@ class MinesweeperEnv:
             "step": int(self.step_count),
             "last_new_reveals": int(self._last_new_reveals),
             "revealed_frac": revealed_frac,
+            "toggles": 0,
         }
 
     def _build_obs(self) -> np.ndarray:
-        # channels: revealed, flags, one-hot numbers
-        revealed = self.revealed.astype(np.float32)
-        flags = self.flags.astype(np.float32)
+        channels: list[np.ndarray] = []
+        total_cells = self.H * self.W
+
+        revealed = self.revealed.astype(np.float32, copy=False)
+        channels.append(revealed[None, ...])
+
+        if self.cfg.include_flags_channel:
+            channels.append(self.flags.astype(np.float32, copy=False)[None, ...])
 
         onehot = np.zeros((9, self.H, self.W), dtype=np.float32)
         if self.first_click_done:
-            # activate one-hot only where revealed
             counts = self.adjacent_counts
             for k in range(9):
                 mask_k = (counts == k) & self.revealed
                 if mask_k.any():
                     onehot[k][mask_k] = 1.0
-        # else keep zeros (no numbers known yet)
+        channels.append(onehot)
 
-        obs = np.concatenate([
-            revealed[None, ...],
-            flags[None, ...],
-            onehot,
-        ], axis=0)
+        if self.cfg.include_frontier_channel:
+            frontier = self._compute_frontier().astype(np.float32, copy=False)
+            channels.append(frontier[None, ...])
+
+        if self.cfg.include_remaining_mines_channel:
+            channels.append(
+                np.full((1, self.H, self.W), self._remaining_mines_ratio(), dtype=np.float32)
+            )
+
+        if self.cfg.include_progress_channel:
+            safe_total = max(1, total_cells - int(self.cfg.mine_count))
+            progress = float(self.revealed.sum()) / float(safe_total)
+            channels.append(np.full((1, self.H, self.W), progress, dtype=np.float32))
+
+        obs = np.concatenate(channels, axis=0)
         return obs.astype(np.float32, copy=False)
 
     def _compute_action_mask(self) -> np.ndarray:
@@ -241,6 +265,31 @@ class MinesweeperEnv:
             if not progress:
                 break
         return total_revealed, total_flagged
+
+    def _compute_frontier(self) -> np.ndarray:
+        if not self.first_click_done:
+            return np.zeros((self.H, self.W), dtype=bool)
+        number_cells = self.revealed & (self.adjacent_counts > 0)
+        if not number_cells.any():
+            return np.zeros((self.H, self.W), dtype=bool)
+        frontier = np.zeros((self.H, self.W), dtype=bool)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                shifted = self._shift_bool(number_cells, dr, dc)
+                frontier |= shifted
+        unknown = (~self.revealed) & (~self.flags)
+        frontier &= unknown
+        return frontier
+
+    def _remaining_mines_ratio(self) -> float:
+        total_mines = int(self.cfg.mine_count)
+        if total_mines <= 0:
+            return 0.0
+        flagged_true = int((self.flags & self.mine_mask).sum()) if self.first_click_done else 0
+        remaining = max(0, total_mines - flagged_true)
+        return float(remaining) / float(total_mines)
 
     def _place_mines_safe(self, first_click_rc: Tuple[int, int]) -> None:
         r0, c0 = first_click_rc
