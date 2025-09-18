@@ -7,8 +7,8 @@ env:
   progress_scale: 0.6
 
 ppo:
-  num_envs: 256
-  steps_per_env: 128
+  num_envs: 128
+  steps_per_env: 64
   mini_batches: 8
   ppo_epochs: 3
   gamma: 0.995
