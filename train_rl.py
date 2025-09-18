@@ -294,18 +294,23 @@ def main():
     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_final)
     last_ckpt = ckpt_final
 
-    # End-of-training evaluation (fast reveal-only + full with safeguards)
+    # End-of-training evaluation
     try:
         eval_eps = int(max(8, args.eval_episodes))
         eval_envs = int(min(args.eval_num_envs, eval_eps))
         # Reveal-only
-        m_reveal = evaluate_vec(model, env_cfg, episodes=eval_eps, seed=0, num_envs=eval_envs, progress_every=0, reveal_only=True)
-        # Full with caps
-        m_full = evaluate_vec(model, env_cfg, episodes=eval_eps, seed=0, num_envs=eval_envs, progress_every=0, reveal_only=False, max_steps_per_episode=512, reveal_fallback_every=25)
+        m_reveal = evaluate_vec(
+            model,
+            env_cfg,
+            episodes=eval_eps,
+            seed=0,
+            num_envs=eval_envs,
+            progress_every=0,
+            reveal_only=True,
+        )
         summary = {
             "checkpoint": os.path.basename(last_ckpt) if last_ckpt else None,
-            "reveal_only": m_reveal,
-            "full": m_full,
+            "metrics": m_reveal,
         }
         with open(os.path.join(args.out, "summary.json"), "w") as f:
             json.dump(summary, f)
