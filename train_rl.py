@@ -26,31 +26,6 @@ from minesweeper.ppo import PPOConfig, ppo_update
 from eval import evaluate_vec
 
 
-def _clone_state_dict(module: nn.Module) -> dict:
-    return {k: v.detach().clone() for k, v in module.state_dict().items()}
-
-
-def _ema_update(state: dict | None, module: nn.Module, decay: float) -> dict:
-    new_state = module.state_dict()
-    if state is None:
-        return {k: v.detach().clone() for k, v in new_state.items()}
-    no_decay = 1.0 - decay
-    with torch.no_grad():
-        for k, v in new_state.items():
-            state[k].mul_(decay).add_(v.detach(), alpha=no_decay)
-    return state
-
-
-def _load_state_dict(module: nn.Module, state: dict) -> None:
-    module.load_state_dict(state, strict=False)
-
-
-def _state_to_cpu(state: dict | None) -> dict | None:
-    if state is None:
-        return None
-    return {k: v.detach().cpu() for k, v in state.items()}
-
-
 def _average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
     if not metrics_list:
         return {}
@@ -64,7 +39,7 @@ def _average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
             avg[k] = float('nan')
     return avg
 
-def _evaluate_with_ema(
+def _evaluate_model(
     model: nn.Module,
     env_cfg: EnvConfig,
     *,
@@ -72,28 +47,18 @@ def _evaluate_with_ema(
     num_envs: int,
     seed: int,
     pairs: int = 1,
-    use_ema: bool = False,
-    ema_state: dict | None = None,
 ) -> dict[str, float]:
-    state_backup = None
-    if use_ema and ema_state is not None:
-        state_backup = _clone_state_dict(model)
-        _load_state_dict(model, ema_state)
     metrics_list = []
-    try:
-        for i in range(max(1, pairs)):
-            metrics = evaluate_vec(
-                model,
-                env_cfg,
-                episodes=episodes,
-                seed=seed + i,
-                num_envs=num_envs,
-                progress_every=0,
-            )
-            metrics_list.append(metrics)
-    finally:
-        if state_backup is not None:
-            _load_state_dict(model, state_backup)
+    for i in range(max(1, pairs)):
+        metrics = evaluate_vec(
+            model,
+            env_cfg,
+            episodes=episodes,
+            seed=seed + i,
+            num_envs=num_envs,
+            progress_every=0,
+        )
+        metrics_list.append(metrics)
     return _average_metrics(metrics_list)
 
 
@@ -280,11 +245,8 @@ def main() -> None:
     parser.add_argument("--quick_eval_pairs", type=int, default=2, help="Quick eval repetitions (averaged)")
     parser.add_argument("--quick_eval_interval", type=int, default=10, help="Run quick evaluation every N updates (0 disables)")
     parser.add_argument("--eval_pairs", type=int, default=1, help="Repeat final evaluation batches (averaged)")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay for parameter averaging (set 0 to disable)")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing for transformer blocks")
     args = parser.parse_args()
-
-    ema_decay = max(0.0, float(args.ema_decay))
 
     cfg, env_overrides, model_cfg, extra_cfg = load_config(args.config)
     training_opts = extra_cfg.get("training", {}) if isinstance(extra_cfg, dict) else {}
@@ -375,10 +337,6 @@ def main() -> None:
             else:
                 log.info(f"Loaded init checkpoint from {args.init_ckpt}")
 
-    ema_state = None
-    if ema_decay > 0:
-        ema_state = _ema_update(None, model, ema_decay)
-
     opt = AdamW(model.parameters(), lr=cfg.lr)
     sched = CosineAnnealingLR(opt, T_max=cfg.total_updates)
     ppo_cfg = PPOConfig(
@@ -460,8 +418,6 @@ def main() -> None:
                     aux_count += 1
 
         sched.step()
-        if ema_decay > 0:
-            ema_state = _ema_update(ema_state, model, ema_decay)
         dt = time.time() - t0
         if count > 0:
             loss_avg = loss_sum / count
@@ -505,8 +461,6 @@ def main() -> None:
                 "cfg": dict(cfg.__dict__),
                 "model_meta": model_meta,
             }
-            if ema_state is not None:
-                payload_latest["model_ema"] = _state_to_cpu(ema_state)
             torch.save(payload_latest, ckpt_latest)
 
         quick_episodes = min(args.eval_quick_episodes, args.eval_episodes)
@@ -514,15 +468,13 @@ def main() -> None:
         should_quick_eval = quick_episodes > 0 and (interval is None or (update + 1) % interval == 0)
         if should_quick_eval:
             try:
-                metrics_quick = _evaluate_with_ema(
+                metrics_quick = _evaluate_model(
                     model,
                     env_cfg,
                     episodes=quick_episodes,
                     seed=args.seed * 1000 + (update + 1) * 7,
                     num_envs=min(args.eval_num_envs, max(1, quick_episodes // 8)),
                     pairs=args.quick_eval_pairs,
-                    use_ema=ema_decay > 0,
-                    ema_state=ema_state,
                 )
                 win_quick = float(metrics_quick.get("win_rate", 0.0))
                 row = per_update_rows[-1]
@@ -556,8 +508,6 @@ def main() -> None:
                         "metric": metrics_quick,
                         "model_meta": model_meta,
                     }
-                    if ema_state is not None:
-                        payload_best["model_ema"] = _state_to_cpu(ema_state)
                     torch.save(payload_best, ckpt_best)
             except Exception as exc:  # pragma: no cover - best effort
                 log.warning(f"Quick eval failed at update {update+1}: {exc}")
@@ -580,8 +530,6 @@ def main() -> None:
         "cfg": dict(cfg.__dict__),
         "model_meta": model_meta,
     }
-    if ema_state is not None:
-        payload_final["model_ema"] = _state_to_cpu(ema_state)
     torch.save(payload_final, ckpt_final)
     last_ckpt = ckpt_final
 
@@ -589,34 +537,18 @@ def main() -> None:
     try:
         eval_eps = int(max(8, args.eval_episodes))
         eval_envs = int(min(args.eval_num_envs, eval_eps))
-        metrics_raw = _evaluate_with_ema(
+        metrics_raw = _evaluate_model(
             model,
             env_cfg,
             episodes=eval_eps,
             seed=args.seed * 17,
             num_envs=eval_envs,
             pairs=args.eval_pairs,
-            use_ema=False,
-            ema_state=None,
         )
-        metrics_ema = None
-        if ema_state is not None and ema_decay > 0:
-            metrics_ema = _evaluate_with_ema(
-                model,
-                env_cfg,
-                episodes=eval_eps,
-                seed=args.seed * 17 + 101,
-                num_envs=eval_envs,
-                pairs=args.eval_pairs,
-                use_ema=True,
-                ema_state=ema_state,
-            )
         summary = {
             "checkpoint": os.path.basename(last_ckpt) if last_ckpt else None,
             "metrics_raw": metrics_raw,
-            "metrics_ema": metrics_ema,
             "model": model_meta,
-            "ema_decay": ema_decay,
             "seed": args.seed,
             "quick_eval_pairs": args.quick_eval_pairs,
             "quick_eval_interval": args.quick_eval_interval,
