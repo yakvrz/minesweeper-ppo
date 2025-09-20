@@ -123,11 +123,7 @@ def main():
         mine_labels = torch.stack(mine_list).to(device=device, dtype=torch.float32)
 
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            logits, _, aux_maps = model(obs, return_mine=True)
-            if isinstance(aux_maps, tuple):
-                mine_logits = aux_maps[0]
-            else:
-                mine_logits = aux_maps
+            logits, _, mine_logits = model(obs, return_mine=True)
             # Avoid float16 overflow in masking constant
             neg_inf = -1e9
             if logits.dtype in (torch.float16, torch.bfloat16):
@@ -152,4 +148,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -31,12 +31,7 @@ class _ResidualBlock(nn.Module):
 
 
 class CNNResidualPolicy(nn.Module):
-    """Higher-capacity CNN Minesweeper policy with residual blocks.
-
-    Keeps convolutional inductive biases while scaling parameters via a deep
-    residual stack so it can serve as a drop-in alternative to the transformer
-    on medium boards.
-    """
+    """Higher-capacity convolutional Minesweeper policy/value network."""
 
     def __init__(
         self,
@@ -47,7 +42,6 @@ class CNNResidualPolicy(nn.Module):
         dropout: float = 0.05,
         value_hidden: int = 256,
         tie_reveal_to_belief: bool = False,
-        cascade_gamma: float = 1.0,
     ) -> None:
         super().__init__()
         if stem_channels <= 0:
@@ -63,10 +57,8 @@ class CNNResidualPolicy(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        res_layers = []
-        for _ in range(blocks):
-            res_layers.append(_ResidualBlock(stem_channels, groups, dropout=dropout))
-        self.residual_stack = nn.Sequential(*res_layers)
+        layers = [_ResidualBlock(stem_channels, groups, dropout=dropout) for _ in range(blocks)]
+        self.residual_stack = nn.Sequential(*layers)
 
         self.policy_head = nn.Sequential(
             nn.Conv2d(stem_channels, stem_channels, kernel_size=1),
@@ -87,14 +79,8 @@ class CNNResidualPolicy(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(stem_channels, 1, kernel_size=1),
         )
-        self.cascade_head = nn.Sequential(
-            nn.Conv2d(stem_channels, stem_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(stem_channels, 1, kernel_size=1),
-        )
 
         self.tie_reveal_to_belief = bool(tie_reveal_to_belief)
-        self.cascade_gamma = float(cascade_gamma)
         if self.tie_reveal_to_belief:
             self.belief_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
             self.belief_policy_proj = nn.Sequential(
@@ -108,7 +94,7 @@ class CNNResidualPolicy(nn.Module):
         self._last_beta_reg: Optional[torch.Tensor] = None
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:  # pragma: no cover
-        # Provided for API parity with transformer models. Not currently used.
+        # Provided for API parity with transformer models.
         return None
 
     def forward(self, x: torch.Tensor, return_mine: bool = False):
@@ -118,13 +104,9 @@ class CNNResidualPolicy(nn.Module):
         B, _, H, W = f.shape
         mine_logits_map: Optional[torch.Tensor] = None
         mine_logits_flat: Optional[torch.Tensor] = None
-        cascade_logits_map: Optional[torch.Tensor] = None
-        cascade_logits_flat: Optional[torch.Tensor] = None
         if return_mine or self.tie_reveal_to_belief:
             mine_logits_map = self.mine_head(f)
             mine_logits_flat = mine_logits_map.view(B, -1)
-            cascade_logits_map = self.cascade_head(f)
-            cascade_logits_flat = cascade_logits_map.view(B, -1)
 
         if self.tie_reveal_to_belief:
             assert self.belief_pool is not None and self.belief_policy_proj is not None
@@ -136,14 +118,7 @@ class CNNResidualPolicy(nn.Module):
             if mine_logits_flat is None:
                 mine_logits_map = self.mine_head(f)
                 mine_logits_flat = mine_logits_map.view(B, -1)
-            mine_probs = torch.sigmoid(mine_logits_flat)
-            if cascade_logits_flat is None:
-                cascade_logits_map = self.cascade_head(f)
-                cascade_logits_flat = cascade_logits_map.view(B, -1)
-            cascade_expect = F.softplus(cascade_logits_flat)
-            policy_logits_flat = (
-                -beta * mine_probs + self.cascade_gamma * cascade_expect + bias
-            ).view(B, H * W)
+            policy_logits_flat = (-beta * mine_logits_flat + bias).view(B, H * W)
         else:
             self._last_beta_reg = None
             logits = self.policy_head(f)
@@ -153,9 +128,7 @@ class CNNResidualPolicy(nn.Module):
         if return_mine:
             if mine_logits_map is None:
                 mine_logits_map = self.mine_head(f)
-            if cascade_logits_map is None:
-                cascade_logits_map = self.cascade_head(f)
-            return policy_logits_flat, value, (mine_logits_map, cascade_logits_map)
+            return policy_logits_flat, value, mine_logits_map
         return policy_logits_flat, value
 
     def beta_regularizer(self) -> torch.Tensor:

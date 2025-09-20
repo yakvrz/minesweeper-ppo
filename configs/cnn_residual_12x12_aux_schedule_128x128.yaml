@@ -12,10 +12,12 @@ env:
   step_penalty: 0.0001
 
 model:
-  name: cnn
-  hidden: 64
-  tie_reveal_to_belief: false
-  cascade_gamma: 1.0
+  name: cnn_residual
+  stem_channels: 160
+  blocks: 8
+  dropout: 0.05
+  value_hidden: 320
+  tie_reveal_to_belief: true
 
 ppo:
   num_envs: 128
@@ -32,7 +34,6 @@ ppo:
   lr: 0.0003
   max_grad_norm: 0.5
   aux_mine_weight: 0.02
-  aux_cascade_weight: 0.01
 
 training:
   beta_l2: 0.0001

@@ -3,7 +3,6 @@ env:
   W: 12
   mine_count: 20
   guarantee_safe_neighborhood: true
-  use_pair_constraints: false
   include_flags_channel: false
   include_frontier_channel: true
   include_progress_channel: true
@@ -15,11 +14,10 @@ model:
   name: cnn
   hidden: 64
   tie_reveal_to_belief: true
-  cascade_gamma: 1.0
 
 ppo:
-  num_envs: 128
-  steps_per_env: 128
+  num_envs: 64
+  steps_per_env: 64
   mini_batches: 8
   ppo_epochs: 3
   gamma: 0.995
@@ -32,7 +30,6 @@ ppo:
   lr: 0.0003
   max_grad_norm: 0.5
   aux_mine_weight: 0.02
-  aux_cascade_weight: 0.01
 
 training:
   beta_l2: 0.0001
@@ -41,6 +38,3 @@ training:
   aux_mine_warmup_updates: 30
   aux_mine_final_weight: 0.02
   aux_mine_decay_power: 1.0
-  rollout:
-    num_envs: 128
-    steps_per_env: 128

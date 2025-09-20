@@ -15,7 +15,6 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.003
     aux_mine_weight: float = 0.0
-    aux_cascade_weight: float = 0.0
     max_grad_norm: float = 0.5
     beta_l2: float = 0.0
     adv_guess_weight: float = 0.0
@@ -25,27 +24,11 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
     use_cuda = batch.obs.is_cuda
     autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
     with autocast_ctx:
-        need_aux_maps = (
-            cfg.aux_mine_weight > 0
-            or cfg.aux_cascade_weight > 0
-            or cfg.adv_guess_weight > 0
-        )
-        if need_aux_maps:
-            logits, value, aux_maps = model(batch.obs, return_mine=True)
-            if isinstance(aux_maps, tuple):
-                if len(aux_maps) == 2:
-                    mine_logits, cascade_logits = aux_maps
-                else:
-                    mine_logits = aux_maps[0]
-                    cascade_logits = aux_maps[1] if len(aux_maps) > 1 else None
-            else:
-                mine_logits = aux_maps
-                cascade_logits = None
+        if cfg.aux_mine_weight > 0:
+            logits, value, mine_logits = model(batch.obs, return_mine=True)
         else:
             logits, value = model(batch.obs, return_mine=False)
             mine_logits = None
-            cascade_logits = None
-        # Choose masking constant safe for dtype
         neg_inf = -1e9
         if logits.dtype in (torch.float16, torch.bfloat16):
             neg_inf = -1e4
@@ -59,7 +42,6 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
         s2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * batch.advantages
         policy_loss = -torch.min(s1, s2).mean()
 
-        # value is [B] (from model). Ensure 1-D
         value_pred = value.view(-1)
         value_clipped = batch.values + (value_pred - batch.values).clamp(-cfg.clip_eps_v, cfg.clip_eps_v)
         v1 = (value_pred - batch.returns).pow(2)
@@ -92,20 +74,6 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
                 loss = loss + cfg.aux_mine_weight * aux_bce
             else:
                 aux_bce = torch.zeros((), dtype=logits_flat.dtype, device=logits_flat.device)
-
-        aux_cascade = None
-        if (
-            cfg.aux_cascade_weight > 0
-            and cascade_logits is not None
-            and hasattr(batch, "cascade_targets")
-        ):
-            cascade_flat = cascade_logits.view(cascade_logits.shape[0], -1)
-            gather_idx = torch.arange(cascade_flat.shape[0], device=cascade_flat.device)
-            chosen_raw = cascade_flat[gather_idx, batch.actions]
-            cascade_pred = F.softplus(chosen_raw)
-            targets = batch.cascade_targets.to(cascade_pred.dtype)
-            aux_cascade = F.smooth_l1_loss(cascade_pred, targets)
-            loss = loss + cfg.aux_cascade_weight * aux_cascade
 
         if cfg.beta_l2 > 0 and hasattr(model, "beta_regularizer"):
             beta_pen = model.beta_regularizer()
@@ -144,8 +112,6 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
     }
     if aux_bce is not None:
         stats["aux_bce"] = float(aux_bce.item())
-    if aux_cascade is not None:
-        stats["aux_cascade"] = float(aux_cascade.item())
     if cfg.adv_guess_weight > 0:
         stats["adv_weight"] = float(cfg.adv_guess_weight)
     if adv_penalty_mean is not None:

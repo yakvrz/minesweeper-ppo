@@ -122,7 +122,6 @@ class TransformerPolicy(nn.Module):
         tie_reveal_to_belief: bool = False,
         num_global_tokens: int = 2,
         mlp_ratio_last: float | None = None,
-        cascade_gamma: float = 1.0,
     ) -> None:
         super().__init__()
         self.H, self.W = board_shape
@@ -135,7 +134,6 @@ class TransformerPolicy(nn.Module):
         self.num_global_tokens = max(0, int(num_global_tokens))
         self.gradient_checkpointing = False
         self._last_beta_reg: Optional[torch.Tensor] = None
-        self.cascade_gamma = float(cascade_gamma)
 
         token_dim = 1 + 9
         if include_flags_channel:
@@ -211,12 +209,6 @@ class TransformerPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
-        self.cascade_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1),
-        )
 
         rows = torch.arange(self.H)
         cols = torch.arange(self.W)
@@ -287,7 +279,7 @@ class TransformerPolicy(nn.Module):
             if self.gradient_checkpointing and self.training:
                 try:
                     x = checkpoint(blk, x, use_reentrant=False)
-                except TypeError:  # pragma: no cover - PyTorch < 2.0 fallback
+                except TypeError:  # pragma: no cover
                     x = checkpoint(blk, x)
             else:
                 x = blk(x)
@@ -295,16 +287,12 @@ class TransformerPolicy(nn.Module):
 
         cls_token, token_states = x[:, :1], x[:, 1 : self.N + 1]
         mine_logits_map = None
-        cascade_logits_map = None
-        need_aux = self.tie_reveal_to_belief or return_mine
-        if need_aux:
+        need_mine = self.tie_reveal_to_belief or return_mine
+        if need_mine:
             mine_logits_flat = self.mine_head(token_states).squeeze(-1)
-            cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
             mine_logits_map = mine_logits_flat.view(B, 1, self.H, self.W)
-            cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
         else:
             mine_logits_flat = None
-            cascade_logits_flat = None
 
         if self.tie_reveal_to_belief:
             assert self.belief_policy_proj is not None
@@ -316,14 +304,7 @@ class TransformerPolicy(nn.Module):
             beta_raw, bias = params.split(1, dim=-1)
             beta = F.softplus(beta_raw) + 1e-3
             self._last_beta_reg = (beta ** 2).mean()
-            mine_probs = torch.sigmoid(mine_logits_flat)
-            if cascade_logits_flat is None:
-                cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
-                cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
-            cascade_expect = F.softplus(cascade_logits_flat)
-            policy_logits_flat = (
-                -beta * mine_probs + self.cascade_gamma * cascade_expect + bias
-            ).view(B, self.N)
+            policy_logits_flat = (-beta * mine_logits_flat + bias).view(B, self.N)
         else:
             self._last_beta_reg = None
             logits_tokens = self.policy_head(token_states).squeeze(-1)
@@ -335,10 +316,7 @@ class TransformerPolicy(nn.Module):
             if mine_logits_map is None:
                 mine_logits_flat = self.mine_head(token_states).squeeze(-1)
                 mine_logits_map = mine_logits_flat.view(B, 1, self.H, self.W)
-            if cascade_logits_map is None:
-                cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
-                cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
-            return policy_logits_flat, value, (mine_logits_map, cascade_logits_map)
+            return policy_logits_flat, value, mine_logits_map
         return policy_logits_flat, value
 
     def beta_regularizer(self) -> torch.Tensor:

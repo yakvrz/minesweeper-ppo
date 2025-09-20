@@ -118,7 +118,6 @@ class PPOTrainConfig:
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     aux_mine_weight: float = 0.0
-    aux_cascade_weight: float = 0.0
     total_updates: int = 1000
 
 
@@ -151,7 +150,6 @@ def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict, dict, dict]
         lr=ppo_d.get("lr", base.lr),
         max_grad_norm=ppo_d.get("max_grad_norm", base.max_grad_norm),
         aux_mine_weight=ppo_d.get("aux_mine_weight", base.aux_mine_weight),
-        aux_cascade_weight=ppo_d.get("aux_cascade_weight", base.aux_cascade_weight),
         total_updates=ppo_d.get("total_updates", base.total_updates),
     )
     extras = {k: v for k, v in data.items() if k not in ("env", "ppo", "model")}
@@ -173,7 +171,6 @@ def collect_rollout(
     steps: int,
     device: torch.device,
     aux_mine_weight: float = 0.0,
-    aux_cascade_weight: float = 0.0,
 ) -> tuple[RolloutBuffer, Dict]:
     batch = vec.reset()
     obs_np = batch["obs"]
@@ -188,8 +185,7 @@ def collect_rollout(
     buffer = RolloutBuffer(num_envs=num_envs, steps=steps, obs_shape=(C, H, W), action_dim=action_dim, device=device)
 
     need_aux_mine = aux_mine_weight > 0
-    need_aux_cascade = aux_cascade_weight > 0
-    need_aux_maps = need_aux_mine or need_aux_cascade
+    need_aux_maps = need_aux_mine
     mine_labels_np = mine_valid_np = None
     mine_labels_cpu = mine_valid_cpu = None
     mine_labels_gpu = mine_valid_gpu = None
@@ -260,17 +256,6 @@ def collect_rollout(
         t_bridge = time.perf_counter()
         rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
         dones = torch.from_numpy(dones_np).to(device=device, dtype=torch.bool)
-        cascade_targets_tensor = None
-        if need_aux_cascade:
-            aux_list = infos.get("aux", [])
-            if len(aux_list) != num_envs:
-                cascade_np = np.zeros((num_envs,), dtype=np.float32)
-            else:
-                cascade_np = np.array(
-                    [aux.get("last_new_reveals", 0.0) for aux in aux_list],
-                    dtype=np.float32,
-                )
-            cascade_targets_tensor = torch.from_numpy(cascade_np).to(device=device, dtype=torch.float32)
         tensor_bridge_time += time.perf_counter() - t_bridge
         buffer.add(
             obs.detach(),
@@ -282,7 +267,6 @@ def collect_rollout(
             values.detach().float(),
             mine_labels=mine_labels_tensor,
             mine_valid=mine_valid_tensor,
-            cascade_targets=cascade_targets_tensor,
         )
 
         obs_np = batch["obs"]
@@ -440,7 +424,6 @@ def main() -> None:
         vf_coef=cfg.vf_coef,
         ent_coef=cfg.ent_coef,
         aux_mine_weight=cfg.aux_mine_weight,
-        aux_cascade_weight=cfg.aux_cascade_weight,
         max_grad_norm=cfg.max_grad_norm,
         beta_l2=beta_l2,
         adv_guess_weight=0.0,
@@ -556,7 +539,6 @@ def main() -> None:
             current_aux_weight = 0.0
         current_aux_weight = float(max(0.0, current_aux_weight))
         ppo_cfg.aux_mine_weight = current_aux_weight
-        ppo_cfg.aux_cascade_weight = cfg.aux_cascade_weight
 
         buffer, aux = collect_rollout(
             vec,
@@ -564,7 +546,6 @@ def main() -> None:
             steps=cfg.steps_per_env,
             device=device,
             aux_mine_weight=current_aux_weight,
-            aux_cascade_weight=cfg.aux_cascade_weight,
         )
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
@@ -573,8 +554,6 @@ def main() -> None:
         loss_sum = policy_sum = value_sum = ent_sum = 0.0
         aux_sum = 0.0
         aux_count = 0
-        aux_cascade_sum = 0.0
-        aux_cascade_count = 0
         count = 0
         for _ in range(cfg.ppo_epochs):
             for batch in buffer.get_minibatches(minibatch_size):
@@ -587,9 +566,6 @@ def main() -> None:
                 if "aux_bce" in stats:
                     aux_sum += stats["aux_bce"]
                     aux_count += 1
-                if "aux_cascade" in stats:
-                    aux_cascade_sum += stats["aux_cascade"]
-                    aux_cascade_count += 1
 
         sched.step()
         dt = time.time() - t0
@@ -599,21 +575,13 @@ def main() -> None:
             val_avg = value_sum / count
             ent_avg = ent_sum / count
             aux_avg = aux_sum / max(1, aux_count) if aux_count > 0 else float("nan")
-            cascade_avg = (
-                aux_cascade_sum / max(1, aux_cascade_count)
-                if aux_cascade_count > 0
-                else float("nan")
-            )
         else:
             loss_avg = pol_avg = val_avg = ent_avg = aux_avg = float('nan')
-            cascade_avg = float('nan')
 
         steps_this_update = cfg.num_envs * cfg.steps_per_env
         extra_terms = []
         if aux_count > 0:
             extra_terms.append(f"aux_mine={aux_avg:.4f}")
-        if aux_cascade_count > 0:
-            extra_terms.append(f"aux_cascade={cascade_avg:.4f}")
         aux_str = f" {' '.join(extra_terms)}" if extra_terms else ""
         log.info(
             f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | "
@@ -631,7 +599,6 @@ def main() -> None:
             "entropy": float(ent_avg),
             "ent_coef": float(current_ent_coef),
             "aux_bce": float(aux_avg) if aux_count > 0 else None,
-            "aux_cascade": float(cascade_avg) if aux_cascade_count > 0 else None,
             "aux_weight": float(current_aux_weight),
             "quick_win_rate": None,
             "quick_guesses_per_ep": None,
@@ -781,7 +748,6 @@ def main() -> None:
             "aux_mine_final_weight": aux_final_weight,
             "aux_mine_warmup_updates": aux_warmup_updates if aux_warmup_updates > 0 else None,
             "aux_mine_decay_power": aux_decay_power,
-            "aux_cascade_weight": cfg.aux_cascade_weight,
             "adv_guess_weight": adv_guess_weight,
         }
         with open(os.path.join(args.out, "summary.json"), "w") as f:
