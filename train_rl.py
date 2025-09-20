@@ -27,6 +27,12 @@ from minesweeper.ppo import PPOConfig, ppo_update
 from eval import evaluate_vec
 
 
+try:
+    from torch.backends.cuda import sdp_kernel as _cuda_sdp_kernel
+except (ImportError, AttributeError):
+    _cuda_sdp_kernel = None
+
+
 def _average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
     if not metrics_list:
         return {}
@@ -64,6 +70,28 @@ def _evaluate_model(
 
 
 torch.set_float32_matmul_precision("high")
+
+
+def _configure_flash_attention(mode: str, log: logging.Logger) -> None:
+    if mode == "auto":
+        if torch.cuda.is_available() and _cuda_sdp_kernel is not None:
+            _cuda_sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
+        return
+    if _cuda_sdp_kernel is None:
+        if mode != "auto":
+            log.warning("Flash attention toggle requested but torch does not expose sdp_kernel controls; ignoring")
+        return
+    if not torch.cuda.is_available():
+        log.warning("Flash attention toggle requested but CUDA is unavailable; ignoring")
+        return
+    if mode == "on":
+        _cuda_sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
+        log.info("Flash attention kernels enabled")
+    elif mode == "off":
+        _cuda_sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=True)
+        log.info("Flash attention kernels disabled")
+    else:
+        log.warning("Unknown flash attention mode '%s'; leaving defaults", mode)
 
 
 @dataclass
@@ -287,6 +315,12 @@ def main() -> None:
     parser.add_argument("--quick_eval_interval", type=int, default=10, help="Run quick evaluation every N updates (0 disables)")
     parser.add_argument("--eval_pairs", type=int, default=1, help="Repeat final evaluation batches (averaged)")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing for transformer blocks")
+    parser.add_argument(
+        "--flash_attention",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Control flash-attention kernels (auto uses PyTorch defaults)",
+    )
     args = parser.parse_args()
 
     cfg, env_overrides, model_cfg, extra_cfg = load_config(args.config)
@@ -306,6 +340,8 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
     log = logging.getLogger("train_rl")
+
+    _configure_flash_attention(args.flash_attention, log)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
