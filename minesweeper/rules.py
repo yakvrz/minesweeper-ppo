@@ -111,15 +111,22 @@ def forced_moves(state) -> List[Tuple[str, int]]:
         ]
 
     moves = _forced_moves_numpy(revealed, flags, counts)
+    if not moves and _HAS_TORCH:
+        actions, indices = _forced_moves_torch(revealed, flags, counts)
+        moves = [("reveal" if act == 2 else "flag", int(idx)) for act, idx in zip(actions, indices)]
+
     if moves:
+        moves = _apply_pair_constraints(revealed, flags, counts, moves)
         return moves
 
     if _HAS_TORCH:
         actions, indices = _forced_moves_torch(revealed, flags, counts)
         moves = [("reveal" if act == 2 else "flag", int(idx)) for act, idx in zip(actions, indices)]
-        return moves
+        if moves:
+            moves = _apply_pair_constraints(revealed, flags, counts, moves)
+            return moves
 
-    return _forced_moves_py(revealed, flags, counts)
+    return _apply_pair_constraints(revealed, flags, counts, _forced_moves_py(revealed, flags, counts))
 
 
 def _forced_moves_py(revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray) -> List[Tuple[str, int]]:
@@ -306,3 +313,93 @@ def _neighbors(H: int, W: int, r: int, c: int):
             rr, cc = r + dr, c + dc
             if 0 <= rr < H and 0 <= cc < W:
                 yield rr, cc
+def _apply_pair_constraints(
+    revealed: np.ndarray,
+    flags: np.ndarray,
+    counts: np.ndarray,
+    moves: List[Tuple[str, int]],
+) -> List[Tuple[str, int]]:
+    """Augment move list using simple two-number overlap constraints."""
+
+    if not moves:
+        base_moves: List[Tuple[str, int]] = []
+    else:
+        base_moves = list(moves)
+
+    H, W = revealed.shape
+    number_cells = np.transpose(np.nonzero(revealed & (counts > 0)))
+
+    # Precompute unknown neighbours for each number cell
+    unknown_list: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    flagged_adj: Dict[Tuple[int, int], int] = {}
+    for r, c in number_cells:
+        neigh = list(_neighbors(H, W, r, c))
+        unknown = [(rr, cc) for (rr, cc) in neigh if not revealed[rr, cc] and not flags[rr, cc]]
+        if not unknown:
+            continue
+        unknown_list[(r, c)] = unknown
+        flagged_adj[(r, c)] = sum(1 for (rr, cc) in neigh if flags[rr, cc])
+
+    # Convert existing moves into dictionaries for quick lookup
+    move_map: Dict[int, str] = {idx: act for act, idx in base_moves}
+
+    # Pairwise constraint: For two number cells A and B with overlapping unknowns
+    # If difference in remaining mines equals size difference of unknown sets, we can ded ded.
+    keys = list(unknown_list.keys())
+    for i in range(len(keys)):
+        r1, c1 = keys[i]
+        unknown1 = unknown_list[(r1, c1)]
+        count1 = int(counts[r1, c1]) - flagged_adj[(r1, c1)]
+        set1 = set(unknown1)
+        for j in range(i + 1, len(keys)):
+            r2, c2 = keys[j]
+            unknown2 = unknown_list[(r2, c2)]
+            count2 = int(counts[r2, c2]) - flagged_adj[(r2, c2)]
+            set2 = set(unknown2)
+
+            if not set1 or not set2:
+                continue
+
+            inter = set1 & set2
+            if not inter:
+                continue
+
+            diff1 = set1 - set2
+            diff2 = set2 - set1
+
+            if not diff1 and not diff2:
+                continue
+
+            # If all mines of cell1 are within the intersection, cells unique to cell1 are safe
+            if count1 == len(inter) and diff1:
+                for (rr, cc) in diff1:
+                    idx = rr * W + cc
+                    move_map[idx] = "reveal"
+
+            # If all mines of cell2 are within the intersection, cells unique to cell2 are safe
+            if count2 == len(inter) and diff2:
+                for (rr, cc) in diff2:
+                    idx = rr * W + cc
+                    move_map[idx] = "reveal"
+
+            # If intersection mines account for difference, unique cells must be mines
+            if len(set1) > len(inter) and len(diff1) > 0:
+                mines_remaining1 = count1 - len(inter)
+                if mines_remaining1 == len(diff1) and mines_remaining1 > 0:
+                    for (rr, cc) in diff1:
+                        idx = rr * W + cc
+                        move_map[idx] = "flag"
+
+            if len(set2) > len(inter) and len(diff2) > 0:
+                mines_remaining2 = count2 - len(inter)
+                if mines_remaining2 == len(diff2) and mines_remaining2 > 0:
+                    for (rr, cc) in diff2:
+                        idx = rr * W + cc
+                        move_map[idx] = "flag"
+
+    if not move_map:
+        return []
+
+    merged_moves = [(act, idx) for idx, act in move_map.items()]
+    merged_moves.sort(key=lambda x: x[1])
+    return merged_moves

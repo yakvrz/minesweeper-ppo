@@ -1,0 +1,42 @@
+env:
+  H: 8
+  W: 8
+  guarantee_safe_neighborhood: true
+  include_flags_channel: false
+  include_frontier_channel: true
+  include_progress_channel: true
+  include_remaining_mines_channel: true
+  mine_count: 10
+  progress_scale: 0.6
+  step_penalty: 0.0001
+model:
+  d_model: 128
+  depth: 6
+  mlp_ratio: 2.0
+  name: transformer
+  num_global_tokens: 2
+  num_heads: 8
+  rel_pos_radius: 1
+  tie_reveal_to_belief: true
+ppo:
+  clip_eps: 0.2
+  ent_coef: 0.0015
+  ent_coef_min: 0.0012
+  ent_decay_updates: 200
+  gae_lambda: 0.95
+  gamma: 0.995
+  lr: 0.0003
+  max_grad_norm: 0.5
+  mini_batches: 8
+  num_envs: 128
+  ppo_epochs: 3
+  steps_per_env: 128
+  vf_coef: 0.5
+  aux_mine_weight: 0.02
+training:
+  beta_l2: 0.0001
+  early_stop_patience: 40
+  aux_mine_warmup_weight: 0.04
+  aux_mine_warmup_updates: 30
+  aux_mine_final_weight: 0.02
+  aux_mine_decay_power: 1.0
