@@ -158,53 +158,34 @@ Rule-based solver exposes `forced_moves(state)` returning provably correct revea
 
 ## Model Architecture (PyTorch)
 
-### Overview
+We now ship two interchangeable backbones behind a common `build_model(...)` factory.
 
-A small fully-convolutional network that preserves spatial structure and emits per-cell action logits.
+### CNNPolicy (baseline)
 
-Backbone: 3×3 conv blocks (32→64→64) with normalization; heads: 1×1 conv policy (2 logits per cell, flattened to `2*H*W`) and value (GAP+MLP); optional mine-prob head; see `minesweeper/models.py`.
+* 3×3 conv stack (32→64→64) with GroupNorm + ReLU.
+* Policy head: 1×1 conv → `[B, 1, H, W]` → flatten to `[B, H*W]` reveal logits.
+* Value head: GAP → MLP → scalar per batch.
+* Auxiliary mine head: 1×1 conv → `[B, 1, H, W]` for optional BCE supervision.
 
-### Module Signatures
+Use this for the lightweight baseline or when experimenting on CPUs without attention acceleration.
 
-```python
-# models.py
-import torch, torch.nn as nn
+### TransformerPolicy (token-per-cell)
 
-class CNNPolicy(nn.Module):
-    def __init__(self, in_channels: int, hidden: int = 64):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
-            nn.GroupNorm(4, 32),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.GroupNorm(8, 64),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-        )
-        self.policy_head = nn.Conv2d(64, 1, 1)  # reveal logit per cell
-        self.value_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-        self.mine_head = nn.Conv2d(64, 1, 1)  # optional
+* Tokens: one per cell with features `[revealed, one-hot(0..8), optional frontier, remaining_mines_ratio, progress]`. Flags channel (if enabled) is also wired through.
+* Positional encoding: learned row/column embeddings `E_row[r] + E_col[c]` plus optional 2-D relative bias (radius ≤ 4) inside attention.
+* Backbone: `L` pre-norm Transformer encoder blocks (`d_model=128`, `num_heads=8`, `mlp_ratio=2.0` by default).
+* Heads:
+  * Policy: MLP on token states → scalar per cell.
+  * Value: `[CLS]` token passed through LayerNorm + MLP → scalar.
+  * Mine prob: MLP on token states → `[B,1,H,W]` logits (used for BCE on unknown cells).
 
-    def forward(self, x, return_mine=False):
-        f = self.backbone(x)                 # [B, 64, H, W]
-        logits_2 = self.policy_head(f)       # [B, 2, H, W]
-        B, _, H, W = logits_2.shape
-        policy_logits = logits_2.permute(0,2,3,1).reshape(B, 2*H*W)
-        value = self.value_head(f).squeeze(-1)
-        if return_mine:
-            mine_logits = self.mine_head(f)  # [B,1,H,W]
-            return policy_logits, value, mine_logits
-        return policy_logits, value
-```
+This ViT-style policy tends to learn better global reasoning on larger boards once shaped with the auxiliary mine loss.
 
-**Notes**
+### Model Builder
 
-* Keep it stride-1 to preserve `(H,W)` throughout.
-* Mixed precision and `torch.compile()` recommended on 2.1+.
-* Optional `ConvLSTM` can be added later if needed, but the board is effectively Markovian.
+`minesweeper/models.py` exposes `build_model(name, obs_shape, env_overrides, model_cfg)` which instantiates either backbone. Architecture metadata is stored inside RL checkpoints so `eval.py` can rebuild the exact network automatically. For quicker experiments, see `configs/transformer_small.yaml` (≈0.35× FLOPs vs. the default).
+
+Mixed precision and `torch.compile()` remain recommended for both variants on PyTorch ≥ 2.1.
 
 ---
 
@@ -309,6 +290,17 @@ env:
   guarantee_safe_neighborhood: true
   step_penalty: 0.0001
   progress_scale: 0.6
+  include_frontier_channel: true
+  include_remaining_mines_channel: true
+  include_progress_channel: true
+
+model:
+  name: transformer
+  d_model: 128
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 2.0
+  rel_pos_radius: 4
 
 ppo:
   num_envs: 256
@@ -319,10 +311,10 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.003
+  ent_coef: 0.0015
   lr: 0.0003
   max_grad_norm: 0.5
-  aux_mine_weight: 0.1
+  aux_mine_weight: 0.15
 ```
 
 ---

@@ -7,8 +7,10 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 - Install deps: `pip install -r requirements.txt`
 - Play locally: `python scripts/play_local.py`
 - Imitation learning (optional): `python train_il.py --out runs/il`
-- PPO training: `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
-- Evaluate latest checkpoint: `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
+- PPO training (CNN): `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
+- PPO training (Transformer full): `python train_rl.py --config configs/transformer.yaml --out runs/transformer --model transformer`
+- PPO training (Transformer small): `python train_rl.py --config configs/transformer_small.yaml --out runs/transformer_small --model transformer`
+- Evaluate latest checkpoint (auto-detects CNN/Transformer): `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
 
 ## Reveal-only training (tiny example)
 
@@ -35,20 +37,20 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 
 ## Metrics to monitor
 
-- Full-mode win_rate (primary) and average steps.
-- Average normalized progress (`avg_progress` in evaluation output).
-- Reveal-only win_rate as a sanity check (pure reveal performance).
+- Win rate (primary) and average steps from the reveal-only evaluation.
+- Average normalized progress (`avg_progress`).
+- Optional: compare greedy vs controller-assisted reveal policies if you enable the controller flag in `eval.py`.
 
 ## Layout
 
 - `minesweeper/env.py`: NumPy env + vectorized wrapper
 - `minesweeper/rules.py`: Forced-move solver
-- `minesweeper/models.py`: CNN policy/value (+ optional mine head)
+- `minesweeper/models.py`: CNN + Transformer policies with shared builder (`build_model`)
 - `minesweeper/buffers.py`: PPO rollout buffer with GAE
 - `minesweeper/ppo.py`: PPO update (masked)
 - `eval.py`: Evaluation CLI and utilities (`evaluate`, `evaluate_vec`)
 - `viz.py`: ASCII/heatmap utilities
-- `configs/`: YAML configs
-- `scripts/`: Helper scripts
+- `configs/`: YAML configs (see `transformer_small.yaml` for a lighter attention model)
+- `scripts/`: Helper scripts (`sweep_relpos.py` to scan relative attention radius)
 
 See `ARCHITECTURE.md` for full details.

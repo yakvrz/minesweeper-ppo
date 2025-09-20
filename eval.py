@@ -10,9 +10,12 @@ import json
 
 import numpy as np
 import torch
+import torch.nn as nn
+import yaml
 
 from minesweeper.env import EnvConfig, MinesweeperEnv, VecMinesweeper
-from minesweeper.models import CNNPolicy
+from minesweeper.models import build_model
+from minesweeper.rules import forced_moves
 
 
 def _assert_action_space(mask: torch.Tensor, logits: torch.Tensor, env: MinesweeperEnv) -> None:
@@ -118,9 +121,47 @@ def _controller_update_state(
         if 0 <= cell < reveal_count:
             state.cooldown[cell] = cooldown_steps + 1
 
+def _compute_auroc(labels: np.ndarray, scores: np.ndarray) -> float:
+    labels = labels.reshape(-1)
+    scores = scores.reshape(-1)
+    pos = float((labels == 1).sum())
+    neg = float((labels == 0).sum())
+    if pos == 0 or neg == 0:
+        return float('nan')
+    order = scores.argsort()
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(scores) + 1, dtype=np.float64)
+    pos_ranks = ranks[labels == 1]
+    auc = (pos_ranks.sum() - pos * (pos + 1.0) / 2.0) / (pos * neg)
+    return float(auc)
+
+
+def _compute_ece(probs: np.ndarray, labels: np.ndarray, bins: int = 15) -> float:
+    probs = probs.reshape(-1)
+    labels = labels.reshape(-1)
+    total = probs.shape[0]
+    if total == 0:
+        return float('nan')
+    bin_edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    for i in range(bins):
+        start = bin_edges[i]
+        end = bin_edges[i + 1]
+        if i == bins - 1:
+            mask = (probs >= start) & (probs <= end)
+        else:
+            mask = (probs >= start) & (probs < end)
+        count = mask.sum()
+        if count == 0:
+            continue
+        acc = labels[mask].mean()
+        conf = probs[mask].mean()
+        ece += (count / total) * abs(acc - conf)
+    return float(ece)
+
 @torch.no_grad()
 def debug_eval(
-    model: CNNPolicy,
+    model: nn.Module,
     env_cfg: EnvConfig,
     reveal_only: bool = False,
     max_steps: int = 512,
@@ -140,6 +181,8 @@ def debug_eval(
         if reveal_only:
             half = mask.shape[-1] // 2
             mask[:, half:] = False
+        if not mask.any():
+            mask = torch.ones_like(mask)
 
         if use_controller:
             logits, _, mine_logits = model(obs, return_mine=True)
@@ -228,7 +271,7 @@ def debug_eval(
 
 @torch.no_grad()
 def evaluate(
-    model: CNNPolicy,
+    model: nn.Module,
     env_cfg: EnvConfig,
     episodes: int = 1000,
     seed: int = 0,
@@ -308,8 +351,10 @@ def evaluate(
 
 
 @torch.no_grad()
+
+
 def evaluate_vec(
-    model: CNNPolicy,
+    model: nn.Module,
     env_cfg: EnvConfig,
     episodes: int = 1000,
     seed: int = 0,
@@ -323,8 +368,10 @@ def evaluate_vec(
     controller_cooldown: int = 2,
 ) -> Dict[str, float]:
     device = next(model.parameters()).device
+    train_mode = model.training
+    model.eval()
     vec = VecMinesweeper(num_envs=num_envs, cfg=env_cfg, seed=seed)
-    d = vec.reset()
+    batch = vec.reset()
 
     reveal_count = env_cfg.H * env_cfg.W
     controller_states: List[ControllerState] = []
@@ -332,103 +379,163 @@ def evaluate_vec(
         controller_states = [_init_controller_state(reveal_count) for _ in range(num_envs)]
 
     remaining = episodes
+    processed = 0
     wins = 0
     total_steps = 0
     total_progress = 0.0
     invalids = 0
-    processed = 0
+    total_guess_attempts = 0
+    total_guess_success = 0
+    belief_probs: list[np.ndarray] = []
+    belief_labels: list[np.ndarray] = []
+
     if print_fn is None:
         def print_fn(msg: str):
             print(msg, flush=True)
 
-    while remaining > 0:
-        batch_size = min(num_envs, remaining)
-        finished = 0
-        counted = np.zeros((num_envs,), dtype=bool)
-        step_counters = np.zeros((num_envs,), dtype=np.int32)
-        tick = 0
-        last_reported_finished = 0
-        while finished < batch_size:
-            obs = torch.from_numpy(d["obs"]).to(device=device, dtype=torch.float32)
-            mask = torch.from_numpy(d["action_mask"]).to(device=device, dtype=torch.bool)
-            if reveal_only or (reveal_fallback_every and (tick % reveal_fallback_every == 0)):
-                half = mask.shape[-1] // 2
-                mask[:, half:] = False
-            if use_controller:
+    with torch.no_grad():
+        while remaining > 0:
+            batch_size = min(num_envs, remaining)
+            finished = 0
+            counted = np.zeros((num_envs,), dtype=bool)
+            step_counters = np.zeros((num_envs,), dtype=np.int32)
+            tick = 0
+            last_reported_finished = 0
+            while finished < batch_size:
+                obs = torch.from_numpy(batch["obs"]).to(device=device, dtype=torch.float32)
+                mask = torch.from_numpy(batch["action_mask"]).to(device=device, dtype=torch.bool)
+                if reveal_only or (reveal_fallback_every and (tick % reveal_fallback_every == 0)):
+                    mask[:, reveal_count:] = False
+                empty_rows = ~mask.any(dim=1)
+                if empty_rows.any():
+                    mask[empty_rows] = True
+
                 logits, _, mine_logits = model(obs, return_mine=True)
-            else:
-                logits, _ = model(obs)
-                mine_logits = None
-            _assert_action_space(mask, logits, vec.envs[0])
-            if use_controller:
-                actions_list = []
-                for i in range(mask.shape[0]):
-                    mine_slice = mine_logits[i, 0] if mine_logits is not None else None
-                    action = _controller_select_action(
-                        logits[i], mask[i], controller_states[i], mine_slice, reveal_count, controller_cooldown
-                    )
-                    actions_list.append(action)
-                actions = np.asarray(actions_list, dtype=np.int32)
-            else:
+                _assert_action_space(mask, logits, vec.envs[0])
+
                 masked_logits = logits.masked_fill(~mask, -1e9)
-                actions = masked_logits.argmax(dim=-1).cpu().numpy().astype(np.int32)
-            mask_flat = mask.view(mask.shape[0], -1)
-            picked_mask = mask_flat[torch.arange(mask.shape[0]), torch.from_numpy(actions)]
-            assert bool(picked_mask.all().item()), "selected action masked out"
-            d, rewards, dones, info = vec.step(actions)
-            step_counters += 1
-            aux_list = info.get("aux", [])
-            outcomes = info.get("outcome", [None] * num_envs)
-            for i in range(num_envs):
-                aux = aux_list[i] if i < len(aux_list) else {}
-                new_reveals = int(aux.get("last_new_reveals", 0))
-                toggles = int(aux.get("toggles", 0))
-                if not counted[i]:
-                    total_progress += new_reveals / float(env_cfg.H * env_cfg.W)
-                    if use_controller:
-                        _controller_update_state(
-                            controller_states[i],
-                            int(actions[i]),
-                            reveal_count,
-                            new_reveals,
-                            toggles,
-                            controller_cooldown,
+                if use_controller:
+                    actions_out: list[int] = []
+                    for i in range(mask.shape[0]):
+                        mine_slice = mine_logits[i, 0] if mine_logits is not None else None
+                        action = _controller_select_action(
+                            logits[i], mask[i], controller_states[i], mine_slice, reveal_count, controller_cooldown
                         )
-                if not counted[i] and dones[i]:
-                    outcome = outcomes[i]
-                    if outcome == "win":
-                        wins += 1
-                    total_steps += int(step_counters[i])
-                    step_counters[i] = 0
-                    counted[i] = True
-                    finished += 1
-                    if use_controller:
-                        controller_states[i] = _init_controller_state(reveal_count)
-                if not counted[i] and max_steps_per_episode > 0 and step_counters[i] >= max_steps_per_episode:
-                    total_steps += int(step_counters[i])
-                    step_counters[i] = 0
-                    counted[i] = True
-                    finished += 1
-                    if use_controller:
-                        controller_states[i] = _init_controller_state(reveal_count)
-            tick += 1
-            if progress_every:
-                if (finished - last_reported_finished) >= min(progress_every, batch_size):
-                    print_fn(f"eval progress: {processed + finished}/{episodes} episodes")
-                    last_reported_finished = finished
-                elif tick % 50 == 0:
-                    print_fn(f"eval progress: {processed + finished}/{episodes} episodes (running)")
-        remaining -= batch_size
-        processed += batch_size
-        if progress_every and processed % progress_every == 0:
-            print_fn(f"eval progress: {processed}/{episodes} episodes")
+                        actions_out.append(int(action))
+                    actions = np.asarray(actions_out, dtype=np.int32)
+                else:
+                    actions = masked_logits.argmax(dim=-1).cpu().numpy().astype(np.int32)
+
+                mask_flat = mask.view(mask.shape[0], -1)
+                picked_mask = mask_flat[torch.arange(mask.shape[0]), torch.from_numpy(actions)]
+                if not bool(picked_mask.all().item()):
+                    invalids += int((~picked_mask).sum().item())
+
+                if mine_logits is not None:
+                    mine_prob = torch.sigmoid(mine_logits).cpu().numpy()
+                else:
+                    mine_prob = None
+
+                # Guess statistics and belief logging prior to environment step
+                for idx, env in enumerate(vec.envs):
+                    if counted[idx]:
+                        continue
+                    action = int(actions[idx])
+                    row, col = divmod(action, env.W)
+                    if mine_prob is not None:
+                        unknown_mask = (~env.revealed) & (~env.flags)
+                        if unknown_mask.any():
+                            belief_probs.append(mine_prob[idx, 0][unknown_mask].reshape(-1))
+                            belief_labels.append(env.mine_mask[unknown_mask].astype(np.float32).reshape(-1))
+                    forced = forced_moves(env)
+                    forced_reveals = {mv for mv_act, mv in forced if mv_act == "reveal"}
+                    is_guess = False
+                    if env.first_click_done:
+                        is_guess = len(forced_reveals) == 0
+                    if is_guess:
+                        total_guess_attempts += 1
+                        if not env.mine_mask[row, col]:
+                            total_guess_success += 1
+
+                batch, rewards_np, dones_np, infos = vec.step(actions)
+                rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
+                dones = torch.from_numpy(dones_np).to(device=device, dtype=torch.bool)
+                step_counters += 1
+
+                aux_list = infos.get("aux", [])
+                outcomes = infos.get("outcome", [None] * num_envs)
+                for i in range(num_envs):
+                    aux = aux_list[i] if i < len(aux_list) else {}
+                    new_reveals = int(aux.get("last_new_reveals", 0))
+                    toggles = int(aux.get("toggles", 0))
+                    if not counted[i]:
+                        total_progress += new_reveals / float(env_cfg.H * env_cfg.W)
+                        if use_controller:
+                            _controller_update_state(
+                                controller_states[i],
+                                int(actions[i]),
+                                reveal_count,
+                                new_reveals,
+                                toggles,
+                                controller_cooldown,
+                            )
+                    if not counted[i] and dones[i]:
+                        outcome = outcomes[i]
+                        if outcome == "win":
+                            wins += 1
+                        total_steps += int(step_counters[i])
+                        step_counters[i] = 0
+                        counted[i] = True
+                        finished += 1
+                        if use_controller:
+                            controller_states[i] = _init_controller_state(reveal_count)
+                    if not counted[i] and max_steps_per_episode > 0 and step_counters[i] >= max_steps_per_episode:
+                        total_steps += int(step_counters[i])
+                        step_counters[i] = 0
+                        counted[i] = True
+                        finished += 1
+                        if use_controller:
+                            controller_states[i] = _init_controller_state(reveal_count)
+                tick += 1
+                if progress_every:
+                    if (finished - last_reported_finished) >= min(progress_every, batch_size):
+                        print_fn(f"eval progress: {processed + finished}/{episodes} episodes")
+                        last_reported_finished = finished
+                    elif tick % 50 == 0:
+                        print_fn(f"eval progress: {processed + finished}/{episodes} episodes (running)")
+
+            remaining -= batch_size
+            processed += batch_size
+            if progress_every and processed % progress_every == 0:
+                print_fn(f"eval progress: {processed}/{episodes} episodes")
+
+    if train_mode:
+        model.train()
+
+    if belief_probs:
+        probs_concat = np.concatenate(belief_probs)
+        labels_concat = np.concatenate(belief_labels)
+        belief_auroc = _compute_auroc(labels_concat, probs_concat)
+        belief_ece = _compute_ece(probs_concat, labels_concat)
+    else:
+        belief_auroc = float('nan')
+        belief_ece = float('nan')
 
     return {
-        "win_rate": wins / episodes,
+        "win_rate": wins / max(1, episodes),
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
+        "guesses_per_episode": total_guess_attempts / max(1, episodes),
+        "guess_success_rate": total_guess_success / max(1, total_guess_attempts) if total_guess_attempts else 0.0,
+        "belief_auroc": belief_auroc,
+        "belief_ece": belief_ece,
+        "episodes": int(episodes),
+        "wins": int(wins),
+        "total_guess_attempts": int(total_guess_attempts),
+        "total_guess_success": int(total_guess_success),
     }
+
 
 
 
@@ -448,6 +555,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default=None, help="Path to a specific checkpoint (.pt)")
     parser.add_argument("--episodes", type=int, default=64)
     parser.add_argument("--config", type=str, required=True, help="YAML config path (to build EnvConfig)")
+    parser.add_argument("--model", type=str, default=None, help="Model architecture override if checkpoint metadata is missing")
     parser.add_argument("--num_envs", type=int, default=128)
     parser.add_argument("--progress", action="store_true", help="Print evaluation progress")
     parser.add_argument("--reveal_only", action="store_true", help="Restrict eval actions to reveals only")
@@ -461,7 +569,6 @@ def main():
     )
     args = parser.parse_args()
 
-    import yaml
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.ckpt:
@@ -470,18 +577,48 @@ def main():
         if not args.run_dir:
             raise SystemExit("Provide either --ckpt or --run_dir")
         ckpt_path = _load_latest_checkpoint(args.run_dir)
-    state = torch.load(ckpt_path, map_location=device)
-
-    # Build model
-    # We assume in_channels=11 per spec
-    model = CNNPolicy(in_channels=11).to(device)
-    model.load_state_dict(state["model"])
-    model.eval()
 
     # Env config
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     env_cfg = EnvConfig(**cfg["env"]) if "env" in cfg else EnvConfig(**cfg)
+
+    # Determine observation channels dynamically
+    probe_vec = VecMinesweeper(num_envs=1, cfg=env_cfg, seed=0)
+    probe_obs = probe_vec.reset()["obs"]
+    in_channels = int(probe_obs.shape[1])
+    del probe_vec
+
+    state = torch.load(ckpt_path, map_location=device)
+
+    model_meta = {}
+    if isinstance(state, dict):
+        model_meta = state.get("model_meta", {}) or {}
+    model_cfg = dict(model_meta.get("config", {}))
+    model_cfg.pop("name", None)
+    model_name = args.model or model_meta.get("name", "cnn")
+    env_flag_defaults = {
+        "include_flags_channel": env_cfg.include_flags_channel,
+        "include_frontier_channel": env_cfg.include_frontier_channel,
+        "include_remaining_mines_channel": env_cfg.include_remaining_mines_channel,
+        "include_progress_channel": env_cfg.include_progress_channel,
+    }
+    env_flag_overrides = dict(env_flag_defaults)
+    env_flag_overrides.update(model_meta.get("env_flags", {}))
+    obs_shape = (in_channels, env_cfg.H, env_cfg.W)
+
+    # Build model to match training configuration
+    model = build_model(
+        model_name,
+        obs_shape=obs_shape,
+        env_overrides=env_flag_overrides,
+        model_cfg=model_cfg,
+    ).to(device)
+    state_dict = dict(state["model"]) if isinstance(state, dict) and "model" in state else state
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.eval()
 
     if args.debug_eval:
         debug_eval(
@@ -506,7 +643,7 @@ def main():
         controller_cooldown=args.controller_cooldown,
     )
 
-    summary = {"checkpoint": os.path.basename(ckpt_path), **metrics}
+    summary = {"checkpoint": os.path.basename(ckpt_path), "model": model_name, **metrics}
     print(json.dumps(summary), flush=True)
 
 

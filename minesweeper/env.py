@@ -45,23 +45,50 @@ class MinesweeperEnv:
 
         self.rng = np.random.default_rng(seed)
 
-        # Runtime state
-        self.mine_mask: np.ndarray
-        self.adjacent_counts: np.ndarray
-        self.revealed: np.ndarray
-        self.flags: np.ndarray
-        self.first_click_done: bool
-        self.step_count: int
-        self._last_new_reveals: int = 0
+        # Pre-compute observation bookkeeping
+        self._obs_channel_count = self._calc_obs_channels()
+        self._obs_buffer = np.zeros((self._obs_channel_count, self.H, self.W), dtype=np.float32)
+        self._onehot_buffer = np.zeros((9, self.H, self.W), dtype=np.float32)
+        self._frontier_buffer = np.zeros((self.H, self.W), dtype=bool)
+        self._shift_buffer = np.zeros((self.H, self.W), dtype=bool)
+        self._neighbor_offsets = tuple(
+            (dr, dc)
+            for dr in (-1, 0, 1)
+            for dc in (-1, 0, 1)
+            if not (dr == 0 and dc == 0)
+        )
 
-        self.reset()
-
-    # ------------------------ Public API ------------------------
-    def reset(self) -> Dict[str, Any]:
+        # Runtime state (re-used between resets)
         self.mine_mask = np.zeros((self.H, self.W), dtype=bool)
         self.adjacent_counts = np.zeros((self.H, self.W), dtype=np.uint8)
         self.revealed = np.zeros((self.H, self.W), dtype=bool)
         self.flags = np.zeros((self.H, self.W), dtype=bool)
+        self.first_click_done = False
+        self.step_count = 0
+        self._last_new_reveals = 0
+        self.total_new_reveals = 0.0
+
+        self.reset()
+
+    # ------------------------ Public API ------------------------
+    def _calc_obs_channels(self) -> int:
+        channels = 1  # revealed
+        if self.cfg.include_flags_channel:
+            channels += 1
+        channels += 9  # counts 0..8
+        if self.cfg.include_frontier_channel:
+            channels += 1
+        if self.cfg.include_remaining_mines_channel:
+            channels += 1
+        if self.cfg.include_progress_channel:
+            channels += 1
+        return channels
+
+    def reset(self) -> Dict[str, Any]:
+        self.mine_mask.fill(False)
+        self.adjacent_counts.fill(0)
+        self.revealed.fill(False)
+        self.flags.fill(False)
         self.first_click_done = False
         self.step_count = 0
         self._last_new_reveals = 0
@@ -99,7 +126,10 @@ class MinesweeperEnv:
                 reward += float(self.cfg.loss_reward)
             else:
                 newly_revealed = self._reveal_with_flood_fill(r, c)
-                deductions_revealed, _ = self._apply_deductions()
+                if newly_revealed > 0:
+                    deductions_revealed, _ = self._apply_deductions()
+                else:
+                    deductions_revealed = 0
                 total_new = newly_revealed + deductions_revealed
                 self._last_new_reveals = total_new
                 self.total_new_reveals += float(total_new)
@@ -130,8 +160,7 @@ class MinesweeperEnv:
 
     @property
     def obs_channels(self) -> int:
-        # revealed, flags, one-hot 0..8
-        return 11
+        return self._obs_channel_count
 
     # ------------------------ Internal helpers ------------------------
     def _build_aux(self) -> Dict[str, Any]:
@@ -145,40 +174,43 @@ class MinesweeperEnv:
         }
 
     def _build_obs(self) -> np.ndarray:
-        channels: list[np.ndarray] = []
-        total_cells = self.H * self.W
+        obs = self._obs_buffer
+        ch = 0
 
-        revealed = self.revealed.astype(np.float32, copy=False)
-        channels.append(revealed[None, ...])
+        np.copyto(obs[ch], self.revealed, casting="unsafe")
+        ch += 1
 
         if self.cfg.include_flags_channel:
-            channels.append(self.flags.astype(np.float32, copy=False)[None, ...])
+            np.copyto(obs[ch], self.flags, casting="unsafe")
+            ch += 1
 
-        onehot = np.zeros((9, self.H, self.W), dtype=np.float32)
+        onehot = self._onehot_buffer
+        onehot.fill(0.0)
         if self.first_click_done:
-            counts = self.adjacent_counts
-            for k in range(9):
-                mask_k = (counts == k) & self.revealed
-                if mask_k.any():
-                    onehot[k][mask_k] = 1.0
-        channels.append(onehot)
+            rr, cc = np.nonzero(self.revealed)
+            if rr.size:
+                counts = self.adjacent_counts[rr, cc]
+                onehot[counts, rr, cc] = 1.0
+        obs[ch : ch + 9] = onehot
+        ch += 9
 
         if self.cfg.include_frontier_channel:
-            frontier = self._compute_frontier().astype(np.float32, copy=False)
-            channels.append(frontier[None, ...])
+            frontier = self._compute_frontier()
+            np.copyto(obs[ch], frontier, casting="unsafe")
+            ch += 1
 
         if self.cfg.include_remaining_mines_channel:
-            channels.append(
-                np.full((1, self.H, self.W), self._remaining_mines_ratio(), dtype=np.float32)
-            )
+            remaining_ratio = self._remaining_mines_ratio()
+            obs[ch].fill(float(remaining_ratio))
+            ch += 1
 
         if self.cfg.include_progress_channel:
-            safe_total = max(1, total_cells - int(self.cfg.mine_count))
+            safe_total = max(1, self.A - int(self.cfg.mine_count))
             progress = float(self.revealed.sum()) / float(safe_total)
-            channels.append(np.full((1, self.H, self.W), progress, dtype=np.float32))
+            obs[ch].fill(progress)
+            ch += 1
 
-        obs = np.concatenate(channels, axis=0)
-        return obs.astype(np.float32, copy=False)
+        return obs.copy()
 
     def _compute_action_mask(self) -> np.ndarray:
         # Only unrevealed cells are valid actions
@@ -208,77 +240,59 @@ class MinesweeperEnv:
             newly_revealed += 1
 
             if self.adjacent_counts[rr, cc] == 0:
-                for nr, nc in self._neighbors(rr, cc):
-                    if not self.revealed[nr, nc] and not self.flags[nr, nc]:
-                        if not self.mine_mask[nr, nc]:
-                            q.append((nr, nc))
+                for dr, dc in self._neighbor_offsets:
+                    nr = rr + dr
+                    nc = cc + dc
+                    if nr < 0 or nr >= self.H or nc < 0 or nc >= self.W:
+                        continue
+                    if self.revealed[nr, nc] or self.flags[nr, nc] or self.mine_mask[nr, nc]:
+                        continue
+                    q.append((nr, nc))
         return newly_revealed
-
-    def _maybe_auto_chord(self) -> Tuple[int, int]:
-        """If a revealed number cell has adjacent flags equal to its number,
-        auto-reveal its other unrevealed, unflagged neighbors. Returns count of newly revealed.
-        """
-        total_new = 0
-        events = 0
-        number_cells = np.argwhere(self.revealed & (self.adjacent_counts > 0))
-        for rr, cc in number_cells:
-            num = int(self.adjacent_counts[rr, cc])
-            neigh = self._neighbors(rr, cc)
-            flag_cnt = 0
-            to_reveal = []
-            for nr, nc in neigh:
-                if self.flags[nr, nc] and not self.revealed[nr, nc]:
-                    flag_cnt += 1
-                if (not self.flags[nr, nc]) and (not self.revealed[nr, nc]) and (not self.mine_mask[nr, nc]):
-                    to_reveal.append((nr, nc))
-            if flag_cnt == num and len(to_reveal) > 0:
-                events += 1
-                for tr, tc in to_reveal:
-                    total_new += self._reveal_with_flood_fill(tr, tc)
-        return total_new, events
 
     def _apply_deductions(self) -> Tuple[int, int]:
         if not self.first_click_done:
             return 0, 0
+
         total_revealed = 0
         total_flagged = 0
+
         while True:
-            progress = False
             moves = forced_moves(self)
-            for act_type, idx in moves:
-                r, c = divmod(idx, self.W)
-                if act_type == "flag":
+            if not moves:
+                break
+
+            progress = False
+            for action, idx in moves:
+                r, c = divmod(int(idx), self.W)
+                if action == "flag":
                     if not self.flags[r, c]:
                         self.flags[r, c] = True
                         total_flagged += 1
                         progress = True
                 else:  # reveal
-                    if not self.revealed[r, c] and not self.flags[r, c]:
-                        if self.mine_mask[r, c]:
-                            continue
-                        total_revealed += self._reveal_with_flood_fill(r, c)
-                        progress = True
-            chord_new, chord_events = self._maybe_auto_chord()
-            if chord_new > 0:
-                total_revealed += chord_new
-                progress = True
+                    if not self.revealed[r, c] and not self.mine_mask[r, c]:
+                        newly = self._reveal_with_flood_fill(r, c)
+                        if newly > 0:
+                            total_revealed += newly
+                            progress = True
+
             if not progress:
                 break
+
         return total_revealed, total_flagged
 
     def _compute_frontier(self) -> np.ndarray:
+        frontier = self._frontier_buffer
+        frontier.fill(False)
         if not self.first_click_done:
-            return np.zeros((self.H, self.W), dtype=bool)
+            return frontier
         number_cells = self.revealed & (self.adjacent_counts > 0)
         if not number_cells.any():
-            return np.zeros((self.H, self.W), dtype=bool)
-        frontier = np.zeros((self.H, self.W), dtype=bool)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                shifted = self._shift_bool(number_cells, dr, dc)
-                frontier |= shifted
+            return frontier
+        for dr, dc in self._neighbor_offsets:
+            shifted = self._shift_bool(number_cells, dr, dc, out=self._shift_buffer)
+            frontier |= shifted
         unknown = (~self.revealed) & (~self.flags)
         frontier &= unknown
         return frontier
@@ -321,8 +335,8 @@ class MinesweeperEnv:
             for dc in (-1, 0, 1):
                 if dr == 0 and dc == 0:
                     continue
-                shifted = self._shift_bool(mine_mask, dr, dc)
-                counts = counts + shifted.astype(np.uint8)
+                shifted = self._shift_bool(mine_mask, dr, dc, out=self._shift_buffer)
+                np.add(counts, shifted, out=counts, casting="unsafe")
         return counts
 
     def _neighbors(
@@ -344,9 +358,12 @@ class MinesweeperEnv:
                     neigh.append((rr, cc))
         return tuple(neigh)
 
-    def _shift_bool(self, arr: np.ndarray, dr: int, dc: int) -> np.ndarray:
+    def _shift_bool(self, arr: np.ndarray, dr: int, dc: int, out: Optional[np.ndarray] = None) -> np.ndarray:
         H, W = arr.shape
-        out = np.zeros_like(arr, dtype=bool)
+        if out is None:
+            out = np.zeros_like(arr, dtype=bool)
+        else:
+            out.fill(False)
         r_src_start = max(0, -dr)
         r_src_end = min(H, H - dr)  # exclusive
         c_src_start = max(0, -dc)

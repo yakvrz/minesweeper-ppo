@@ -32,6 +32,7 @@ class RolloutBuffer:
         self.returns = torch.zeros((B,), dtype=torch.float32, device=device)
         # optional labels for auxiliary mine head
         self.mine_labels = None  # set externally if used; shape [B, H, W]
+        self.mine_valid = None   # mask indicating cells contributing to the aux loss
 
         self._t = 0
 
@@ -45,6 +46,7 @@ class RolloutBuffer:
         dones: torch.Tensor,
         values: torch.Tensor,
         mine_labels: torch.Tensor | None = None,
+        mine_valid: torch.Tensor | None = None,
     ) -> None:
         bsz = obs.shape[0]
         s = self._t * bsz
@@ -64,6 +66,14 @@ class RolloutBuffer:
                     device=self.device,
                 )
             self.mine_labels[s:e] = mine_labels
+            if mine_valid is not None:
+                if self.mine_valid is None:
+                    self.mine_valid = torch.zeros(
+                        (self.num_envs * self.steps, obs.shape[-2], obs.shape[-1]),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                self.mine_valid[s:e] = mine_valid
         self._t += 1
 
     def compute_gae(self, last_values: torch.Tensor, gamma: float = 0.995, lam: float = 0.95) -> None:
@@ -103,7 +113,8 @@ class RolloutBuffer:
             }
             if self.mine_labels is not None:
                 batch["mine_labels"] = self.mine_labels[sel]
+                if self.mine_valid is not None:
+                    batch["mine_valid"] = self.mine_valid[sel]
             # simple object with attribute access
             yield type("Batch", (), {k: v for k, v in batch.items()})
-
 

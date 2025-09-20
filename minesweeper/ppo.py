@@ -16,6 +16,7 @@ class PPOConfig:
     ent_coef: float = 0.003
     aux_mine_weight: float = 0.0
     max_grad_norm: float = 0.5
+    beta_l2: float = 0.0
 
 
 def ppo_update(model, optimizer, batch, cfg: PPOConfig) -> Dict[str, float]:
@@ -52,20 +53,44 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig) -> Dict[str, float]:
 
     loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * ent
 
+    aux_bce = None
     if cfg.aux_mine_weight > 0 and hasattr(batch, "mine_labels") and mine_logits is not None:
-        bce = F.binary_cross_entropy_with_logits(mine_logits.squeeze(1), batch.mine_labels)
-        loss = loss + cfg.aux_mine_weight * bce
+        logits_flat = mine_logits.squeeze(1)
+        labels = batch.mine_labels
+        mask = getattr(batch, "mine_valid", None)
+        if mask is None:
+            mask = torch.ones_like(labels, dtype=torch.bool)
+        valid_logits = logits_flat[mask]
+        valid_labels = labels[mask]
+        if valid_labels.numel() > 0:
+            pos = valid_labels.sum()
+            neg = valid_labels.numel() - pos
+            pos_weight = (neg + 1e-6) / (pos + 1e-6)
+            pos_weight_tensor = torch.full((), float(pos_weight), dtype=valid_logits.dtype, device=valid_logits.device)
+            aux_bce = F.binary_cross_entropy_with_logits(
+                valid_logits,
+                valid_labels,
+                pos_weight=pos_weight_tensor,
+            )
+            loss = loss + cfg.aux_mine_weight * aux_bce
+        else:
+            aux_bce = torch.zeros((), dtype=logits_flat.dtype, device=logits_flat.device)
+
+    if cfg.beta_l2 > 0 and hasattr(model, "beta_regularizer"):
+        beta_pen = model.beta_regularizer()
+        loss = loss + cfg.beta_l2 * beta_pen
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
     optimizer.step()
 
-    return {
+    stats = {
         "loss": float(loss.item()),
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
         "entropy": float(ent.item()),
     }
-
-
+    if aux_bce is not None:
+        stats["aux_bce"] = float(aux_bce.item())
+    return stats

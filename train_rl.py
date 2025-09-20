@@ -7,6 +7,7 @@ import time
 import logging
 import json
 import csv
+import math
 from dataclasses import dataclass
 from typing import Dict
 
@@ -19,10 +20,84 @@ from tqdm import tqdm
 import yaml
 
 from minesweeper.env import EnvConfig, VecMinesweeper
-from minesweeper.models import CNNPolicy
+from minesweeper.models import build_model
 from minesweeper.buffers import RolloutBuffer
 from minesweeper.ppo import PPOConfig, ppo_update
 from eval import evaluate_vec
+
+
+def _clone_state_dict(module: nn.Module) -> dict:
+    return {k: v.detach().clone() for k, v in module.state_dict().items()}
+
+
+def _ema_update(state: dict | None, module: nn.Module, decay: float) -> dict:
+    new_state = module.state_dict()
+    if state is None:
+        return {k: v.detach().clone() for k, v in new_state.items()}
+    no_decay = 1.0 - decay
+    with torch.no_grad():
+        for k, v in new_state.items():
+            state[k].mul_(decay).add_(v.detach(), alpha=no_decay)
+    return state
+
+
+def _load_state_dict(module: nn.Module, state: dict) -> None:
+    module.load_state_dict(state, strict=False)
+
+
+def _state_to_cpu(state: dict | None) -> dict | None:
+    if state is None:
+        return None
+    return {k: v.detach().cpu() for k, v in state.items()}
+
+
+def _average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
+    if not metrics_list:
+        return {}
+    keys = set().union(*metrics_list)
+    avg: dict[str, float] = {}
+    for k in keys:
+        vals = [m[k] for m in metrics_list if k in m and m[k] is not None]
+        if vals:
+            avg[k] = float(sum(vals) / len(vals))
+        else:
+            avg[k] = float('nan')
+    return avg
+
+def _evaluate_with_ema(
+    model: nn.Module,
+    env_cfg: EnvConfig,
+    *,
+    episodes: int,
+    num_envs: int,
+    seed: int,
+    pairs: int = 1,
+    use_ema: bool = False,
+    ema_state: dict | None = None,
+) -> dict[str, float]:
+    state_backup = None
+    if use_ema and ema_state is not None:
+        state_backup = _clone_state_dict(model)
+        _load_state_dict(model, ema_state)
+    metrics_list = []
+    try:
+        for i in range(max(1, pairs)):
+            metrics = evaluate_vec(
+                model,
+                env_cfg,
+                episodes=episodes,
+                seed=seed + i,
+                num_envs=num_envs,
+                progress_every=0,
+            )
+            metrics_list.append(metrics)
+    finally:
+        if state_backup is not None:
+            _load_state_dict(model, state_backup)
+    return _average_metrics(metrics_list)
+
+
+torch.set_float32_matmul_precision("high")
 
 
 @dataclass
@@ -52,13 +127,14 @@ class PPOTrainConfig:
     total_updates: int = 1000
 
 
-def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
+def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict, dict, dict]:
     if cfg_path is None:
-        return PPOTrainConfig(), {}
+        return PPOTrainConfig(), {}, {}, {}
     with open(cfg_path, "r") as f:
         data = yaml.safe_load(f)
     env_d = data.get("env", {}) or {}
     ppo_d = data.get("ppo", {}) or {}
+    model_d = data.get("model", {}) or {}
     base = PPOTrainConfig()
     cfg = PPOTrainConfig(
         H=env_d.get("H", base.H),
@@ -82,7 +158,8 @@ def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict]:
         aux_mine_weight=ppo_d.get("aux_mine_weight", base.aux_mine_weight),
         total_updates=ppo_d.get("total_updates", base.total_updates),
     )
-    return cfg, env_d
+    extras = {k: v for k, v in data.items() if k not in ("env", "ppo", "model")}
+    return cfg, env_d, model_d, extras
 
 
 @torch.no_grad()
@@ -99,26 +176,62 @@ def collect_rollout(
     model: nn.Module,
     steps: int,
     device: torch.device,
+    aux_mine_weight: float = 0.0,
 ) -> tuple[RolloutBuffer, Dict]:
     batch = vec.reset()
     obs_np = batch["obs"]
     mask_np = batch["action_mask"]
+    invalid_rows = ~mask_np.any(axis=1)
+    if invalid_rows.any():
+        mask_np[invalid_rows] = True
     num_envs = obs_np.shape[0]
     C, H, W = obs_np.shape[1:]
     action_dim = mask_np.shape[1]
 
     buffer = RolloutBuffer(num_envs=num_envs, steps=steps, obs_shape=(C, H, W), action_dim=action_dim, device=device)
 
+    need_aux = aux_mine_weight > 0
+    mine_labels_np = mine_valid_np = None
+    mine_labels_cpu = mine_valid_cpu = None
+    mine_labels_gpu = mine_valid_gpu = None
+    if need_aux:
+        mine_labels_np = np.zeros((num_envs, H, W), dtype=np.float32)
+        mine_valid_np = np.zeros((num_envs, H, W), dtype=bool)
+        mine_labels_cpu = torch.from_numpy(mine_labels_np)
+        mine_valid_cpu = torch.from_numpy(mine_valid_np)
+        mine_labels_gpu = torch.zeros((num_envs, H, W), dtype=torch.float32, device=device)
+        mine_valid_gpu = torch.zeros((num_envs, H, W), dtype=torch.bool, device=device)
+
     for _ in range(steps):
         obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
         mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
-        logits, values = model(obs)
+        mine_labels_tensor = None
+        mine_valid_tensor = None
+        if need_aux:
+            any_labels = False
+            for i, env in enumerate(vec.envs):
+                if env.first_click_done:
+                    any_labels = True
+                    np.copyto(mine_labels_np[i], env.mine_mask, casting="unsafe")
+                    np.logical_and(~env.revealed, ~env.flags, out=mine_valid_np[i])
+                else:
+                    mine_labels_np[i].fill(0.0)
+                    mine_valid_np[i].fill(False)
+            if any_labels:
+                mine_labels_gpu.copy_(mine_labels_cpu, non_blocking=True)
+                mine_valid_gpu.copy_(mine_valid_cpu, non_blocking=True)
+                mine_labels_tensor = mine_labels_gpu
+                mine_valid_tensor = mine_valid_gpu
+
+        if need_aux:
+            logits, values, _ = model(obs, return_mine=True)
+        else:
+            logits, values = model(obs)
         logits = logits.masked_fill(~mask, -1e9)
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
         logp = dist.log_prob(actions)
 
-        # no auxiliary mine labels needed in reveal-only setup
         actions_np = actions.cpu().numpy().astype(np.int32)
         batch, rewards_np, dones_np, infos = vec.step(actions_np)
 
@@ -132,38 +245,62 @@ def collect_rollout(
             rewards,
             dones,
             values.detach(),
+            mine_labels=mine_labels_tensor,
+            mine_valid=mine_valid_tensor,
         )
 
         obs_np = batch["obs"]
         mask_np = batch["action_mask"]
+        invalid_rows = ~mask_np.any(axis=1)
+        if invalid_rows.any():
+            mask_np[invalid_rows] = True
 
     obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
     mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
     with torch.no_grad():
-        _, last_values = model(obs)
+        if aux_mine_weight > 0:
+            _, last_values, _ = model(obs, return_mine=True)
+        else:
+            _, last_values = model(obs)
     return buffer, {"last_values": last_values}
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="YAML config path")
+    parser.add_argument("--model", type=str, default=None, help="Model architecture override (cnn, transformer, ...)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="runs/ppo")
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--init_ckpt", type=str, default=None, help="Optional init checkpoint from IL")
-    parser.add_argument("--eval_episodes", type=int, default=64)
-    parser.add_argument("--eval_num_envs", type=int, default=128)
+    parser.add_argument("--eval_episodes", type=int, default=2048)
+    parser.add_argument("--eval_num_envs", type=int, default=64)
     parser.add_argument("--save_every", type=int, default=50, help="Save latest checkpoint every N updates")
-    parser.add_argument("--eval_quick_episodes", type=int, default=16, help="Episodes for quick periodic eval to track best")
+    parser.add_argument("--eval_quick_episodes", type=int, default=512, help="Episodes for quick periodic eval to track best")
+    parser.add_argument("--quick_eval_pairs", type=int, default=2, help="Quick eval repetitions (averaged)")
+    parser.add_argument("--quick_eval_interval", type=int, default=10, help="Run quick evaluation every N updates (0 disables)")
+    parser.add_argument("--eval_pairs", type=int, default=1, help="Repeat final evaluation batches (averaged)")
+    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay for parameter averaging (set 0 to disable)")
+    parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing for transformer blocks")
     args = parser.parse_args()
 
-    cfg, env_overrides = load_config(args.config)
+    ema_decay = max(0.0, float(args.ema_decay))
+
+    cfg, env_overrides, model_cfg, extra_cfg = load_config(args.config)
+    training_opts = extra_cfg.get("training", {}) if isinstance(extra_cfg, dict) else {}
+    rollout_opts = training_opts.get("rollout", {}) if isinstance(training_opts, dict) else {}
+    beta_l2 = float(training_opts.get("beta_l2", 0.0))
+
+    if isinstance(rollout_opts, dict):
+        if "num_envs" in rollout_opts:
+            cfg.num_envs = int(rollout_opts["num_envs"])
+        if "steps_per_env" in rollout_opts:
+            cfg.steps_per_env = int(rollout_opts["steps_per_env"])
     if args.updates is not None:
         cfg.total_updates = int(args.updates)
 
     os.makedirs(args.out, exist_ok=True)
 
-    # logging setup
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
     log = logging.getLogger("train_rl")
 
@@ -182,12 +319,66 @@ def main():
 
     dummy = vec.reset()
     in_channels = dummy["obs"].shape[1]
-    model = CNNPolicy(in_channels=in_channels).to(device)
+    obs_shape = (in_channels, dummy["obs"].shape[2], dummy["obs"].shape[3])
+
+    model_cfg_local = dict(model_cfg)
+    model_name = args.model or model_cfg_local.pop("name", "cnn")
+    env_flag_overrides = {
+        "include_flags_channel": env_cfg.include_flags_channel,
+        "include_frontier_channel": env_cfg.include_frontier_channel,
+        "include_remaining_mines_channel": env_cfg.include_remaining_mines_channel,
+        "include_progress_channel": env_cfg.include_progress_channel,
+    }
+    model = build_model(
+        model_name,
+        obs_shape=obs_shape,
+        env_overrides=env_flag_overrides,
+        model_cfg=model_cfg_local,
+    ).to(device)
+
+    grad_ckpt_enabled = bool(args.grad_checkpoint)
+    if not grad_ckpt_enabled and isinstance(training_opts, dict):
+        grad_ckpt_enabled = bool(training_opts.get("gradient_checkpointing", False))
+    if grad_ckpt_enabled and hasattr(model, "set_gradient_checkpointing"):
+        model.set_gradient_checkpointing(True)
+        log.info("Enabled gradient checkpointing on model")
+
+    model_meta = {
+        "name": model_name,
+        "config": dict(model_cfg_local),
+        "env_flags": env_flag_overrides,
+    }
+
+    log.info(f"Model: {model_name} | params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+
+    use_compile = torch.cuda.is_available() and not grad_ckpt_enabled
+    if grad_ckpt_enabled and not use_compile:
+        log.info("Skipping torch.compile because gradient checkpointing is active")
+    if use_compile:
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - best effort
+            log.warning(f"torch.compile failed: {exc}")
+            use_compile = False
+
     if args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location=device)
         if isinstance(state, dict) and "model" in state:
-            model.load_state_dict(state["model"])
-            log.info(f"Loaded init checkpoint from {args.init_ckpt}")
+            state_dict = state["model"]
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+            load_status = model.load_state_dict(state_dict, strict=False)
+            miss = list(load_status.missing_keys)
+            unexpected = list(load_status.unexpected_keys)
+            if miss or unexpected:
+                log.info("Loaded init checkpoint from %s (missing=%s unexpected=%s)", args.init_ckpt, miss, unexpected)
+            else:
+                log.info(f"Loaded init checkpoint from {args.init_ckpt}")
+
+    ema_state = None
+    if ema_decay > 0:
+        ema_state = _ema_update(None, model, ema_decay)
+
     opt = AdamW(model.parameters(), lr=cfg.lr)
     sched = CosineAnnealingLR(opt, T_max=cfg.total_updates)
     ppo_cfg = PPOConfig(
@@ -197,13 +388,39 @@ def main():
         ent_coef=cfg.ent_coef,
         aux_mine_weight=cfg.aux_mine_weight,
         max_grad_norm=cfg.max_grad_norm,
+        beta_l2=beta_l2,
     )
 
     progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
+
+    def _quick_eval_score(metrics: dict[str, float]) -> float:
+        def _safe(value):
+            if value is None:
+                return float('nan')
+            try:
+                return float(value)
+            except Exception:
+                return float('nan')
+
+        win = _safe(metrics.get('win_rate'))
+        guesses_ep = _safe(metrics.get('guesses_per_episode'))
+        guess_success = _safe(metrics.get('guess_success_rate'))
+        auroc = _safe(metrics.get('belief_auroc'))
+        score = win
+        if math.isfinite(guesses_ep):
+            score -= max(0.0, guesses_ep - 1.5) * 0.01
+            score += max(0.0, 1.5 - guesses_ep) * 0.005
+        if math.isfinite(guess_success):
+            score += max(0.0, guess_success - 0.75) * 0.05
+        if math.isfinite(auroc):
+            score += max(0.0, auroc - 0.93) * 0.02
+        return score
+
     per_update_rows = []
-    best_full_win = -1.0
+    best_quick_score = float('-inf')
+    best_quick_metrics: dict[str, float] | None = None
+
     for update in progress:
-        # Entropy decay if configured
         if cfg.ent_decay_updates > 0:
             decay_steps = max(1, int(cfg.ent_decay_updates))
             decay_frac = min(1.0, update / decay_steps)
@@ -213,33 +430,53 @@ def main():
         else:
             current_ent_coef = float(cfg.ent_coef)
         ppo_cfg.ent_coef = current_ent_coef
+
         t0 = time.time()
-        buffer, aux = collect_rollout(vec, model, steps=cfg.steps_per_env, device=device)
+        buffer, aux = collect_rollout(
+            vec,
+            model,
+            steps=cfg.steps_per_env,
+            device=device,
+            aux_mine_weight=cfg.aux_mine_weight,
+        )
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
         B = cfg.num_envs * cfg.steps_per_env
         minibatch_size = B // cfg.mini_batches
         loss_sum = policy_sum = value_sum = ent_sum = 0.0
+        aux_sum = 0.0
+        aux_count = 0
         count = 0
         for _ in range(cfg.ppo_epochs):
             for batch in buffer.get_minibatches(minibatch_size):
                 stats = ppo_update(model, opt, batch, cfg=ppo_cfg)
-                loss_sum += stats["loss"]; policy_sum += stats["policy_loss"]; value_sum += stats["value_loss"]; ent_sum += stats["entropy"]; count += 1
+                loss_sum += stats["loss"]
+                policy_sum += stats["policy_loss"]
+                value_sum += stats["value_loss"]
+                ent_sum += stats["entropy"]
+                count += 1
+                if "aux_bce" in stats:
+                    aux_sum += stats["aux_bce"]
+                    aux_count += 1
 
         sched.step()
+        if ema_decay > 0:
+            ema_state = _ema_update(ema_state, model, ema_decay)
         dt = time.time() - t0
         if count > 0:
             loss_avg = loss_sum / count
             pol_avg = policy_sum / count
             val_avg = value_sum / count
             ent_avg = ent_sum / count
+            aux_avg = aux_sum / max(1, aux_count) if aux_count > 0 else float("nan")
         else:
-            loss_avg = pol_avg = val_avg = ent_avg = float('nan')
+            loss_avg = pol_avg = val_avg = ent_avg = aux_avg = float('nan')
 
         steps_this_update = cfg.num_envs * cfg.steps_per_env
+        aux_str = f" aux={aux_avg:.4f}" if aux_count > 0 else ""
         log.info(
             f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | "
-            f"loss={loss_avg:.4f} pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f} "
+            f"pi={pol_avg:.4f} v={val_avg:.4f} ent={ent_avg:.4f}{aux_str} "
             f"ent_coef={current_ent_coef:.4f}"
         )
 
@@ -252,71 +489,146 @@ def main():
             "value_loss": float(val_avg),
             "entropy": float(ent_avg),
             "ent_coef": float(current_ent_coef),
+            "aux_bce": float(aux_avg) if aux_count > 0 else None,
+            "quick_win_rate": None,
+            "quick_guesses_per_ep": None,
+            "quick_guess_success": None,
+            "quick_belief_auroc": None,
+            "quick_belief_ece": None,
+            "quick_score": None,
         })
 
-        # Save latest periodically (overwrite) and track best by quick full-mode eval
         if (update + 1) % max(1, args.save_every) == 0:
             ckpt_latest = os.path.join(args.out, "ckpt_latest.pt")
-            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_latest)
-        try:
-            m_quick = evaluate_vec(
-                model,
-                env_cfg,
-                episodes=min(args.eval_quick_episodes, args.eval_episodes),
-                seed=0,
-                num_envs=min(args.eval_num_envs, args.eval_quick_episodes),
-                progress_every=0,
-                reveal_only=False,
-                max_steps_per_episode=512,
-                reveal_fallback_every=25,
-            )
-            full_win = float(m_quick.get("win_rate", 0.0))
-            if full_win > best_full_win:
-                best_full_win = full_win
-                ckpt_best = os.path.join(args.out, "ckpt_best.pt")
-                torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "metric": m_quick}, ckpt_best)
-        except Exception as e:
-            log.warning(f"Quick eval failed at update {update+1}: {e}")
+            payload_latest = {
+                "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                "cfg": dict(cfg.__dict__),
+                "model_meta": model_meta,
+            }
+            if ema_state is not None:
+                payload_latest["model_ema"] = _state_to_cpu(ema_state)
+            torch.save(payload_latest, ckpt_latest)
+
+        quick_episodes = min(args.eval_quick_episodes, args.eval_episodes)
+        interval = args.quick_eval_interval if args.quick_eval_interval and args.quick_eval_interval > 0 else None
+        should_quick_eval = quick_episodes > 0 and (interval is None or (update + 1) % interval == 0)
+        if should_quick_eval:
+            try:
+                metrics_quick = _evaluate_with_ema(
+                    model,
+                    env_cfg,
+                    episodes=quick_episodes,
+                    seed=args.seed * 1000 + (update + 1) * 7,
+                    num_envs=min(args.eval_num_envs, max(1, quick_episodes // 8)),
+                    pairs=args.quick_eval_pairs,
+                    use_ema=ema_decay > 0,
+                    ema_state=ema_state,
+                )
+                win_quick = float(metrics_quick.get("win_rate", 0.0))
+                row = per_update_rows[-1]
+                row["quick_win_rate"] = win_quick
+                row["quick_guesses_per_ep"] = metrics_quick.get("guesses_per_episode")
+                row["quick_guess_success"] = metrics_quick.get("guess_success_rate")
+                row["quick_belief_auroc"] = metrics_quick.get("belief_auroc")
+                row["quick_belief_ece"] = metrics_quick.get("belief_ece")
+                score = _quick_eval_score(metrics_quick)
+                row["quick_score"] = score
+                guesses_ep = row["quick_guesses_per_ep"]
+                guess_success = row["quick_guess_success"]
+                auroc = row["quick_belief_auroc"]
+                log.info(
+                    "quick eval upd %d: win_rate=%.3f avg_steps=%.2f guesses/ep=%.2f guess_success=%.2f auroc=%.3f score=%.3f",
+                    update + 1,
+                    win_quick,
+                    metrics_quick.get("avg_steps", float('nan')),
+                    float(guesses_ep) if guesses_ep is not None else float('nan'),
+                    float(guess_success) if guess_success is not None else float('nan'),
+                    float(auroc) if auroc is not None else float('nan'),
+                    score,
+                )
+                if score > best_quick_score:
+                    best_quick_score = score
+                    best_quick_metrics = metrics_quick
+                    ckpt_best = os.path.join(args.out, "ckpt_best.pt")
+                    payload_best = {
+                        "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                        "cfg": dict(cfg.__dict__),
+                        "metric": metrics_quick,
+                        "model_meta": model_meta,
+                    }
+                    if ema_state is not None:
+                        payload_best["model_ema"] = _state_to_cpu(ema_state)
+                    torch.save(payload_best, ckpt_best)
+            except Exception as exc:  # pragma: no cover - best effort
+                log.warning(f"Quick eval failed at update {update+1}: {exc}")
 
     # Export per-update CSV
     try:
         csv_path = os.path.join(args.out, "train_metrics.csv")
-        if per_update_rows:
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=list(per_update_rows[0].keys()))
-                writer.writeheader(); writer.writerows(per_update_rows)
-            log.info(f"Wrote {csv_path}")
-    except Exception as e:
-        log.warning(f"Failed to write train_metrics.csv: {e}")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(per_update_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(per_update_rows)
+        log.info("Wrote %s", csv_path)
+    except Exception as exc:  # pragma: no cover - logging only
+        log.warning("Failed writing train_metrics.csv: %s", exc)
 
     # Final checkpoint
     ckpt_final = os.path.join(args.out, "ckpt_final.pt")
-    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, ckpt_final)
+    payload_final = {
+        "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "cfg": dict(cfg.__dict__),
+        "model_meta": model_meta,
+    }
+    if ema_state is not None:
+        payload_final["model_ema"] = _state_to_cpu(ema_state)
+    torch.save(payload_final, ckpt_final)
     last_ckpt = ckpt_final
 
     # End-of-training evaluation
     try:
         eval_eps = int(max(8, args.eval_episodes))
         eval_envs = int(min(args.eval_num_envs, eval_eps))
-        # Reveal-only
-        m_reveal = evaluate_vec(
+        metrics_raw = _evaluate_with_ema(
             model,
             env_cfg,
             episodes=eval_eps,
-            seed=0,
+            seed=args.seed * 17,
             num_envs=eval_envs,
-            progress_every=0,
-            reveal_only=True,
+            pairs=args.eval_pairs,
+            use_ema=False,
+            ema_state=None,
         )
+        metrics_ema = None
+        if ema_state is not None and ema_decay > 0:
+            metrics_ema = _evaluate_with_ema(
+                model,
+                env_cfg,
+                episodes=eval_eps,
+                seed=args.seed * 17 + 101,
+                num_envs=eval_envs,
+                pairs=args.eval_pairs,
+                use_ema=True,
+                ema_state=ema_state,
+            )
         summary = {
             "checkpoint": os.path.basename(last_ckpt) if last_ckpt else None,
-            "metrics": m_reveal,
+            "metrics_raw": metrics_raw,
+            "metrics_ema": metrics_ema,
+            "model": model_meta,
+            "ema_decay": ema_decay,
+            "seed": args.seed,
+            "quick_eval_pairs": args.quick_eval_pairs,
+            "quick_eval_interval": args.quick_eval_interval,
+            "eval_pairs": args.eval_pairs,
+            "best_quick_metrics": best_quick_metrics,
+            "best_quick_score": best_quick_score,
         }
         with open(os.path.join(args.out, "summary.json"), "w") as f:
             json.dump(summary, f)
-        log.info(f"Wrote summary.json: {summary}")
-    except Exception as e:
-        log.warning(f"End-of-training eval failed: {e}")
+        log.info("Wrote summary.json: %s", summary)
+    except Exception as exc:  # pragma: no cover - logging only
+        log.warning("Final eval failed: %s", exc)
 
 
 if __name__ == "__main__":
