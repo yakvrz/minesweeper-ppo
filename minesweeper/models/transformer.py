@@ -1,42 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class CNNPolicy(nn.Module):
-    def __init__(self, in_channels: int, hidden: int = 64):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
-            nn.GroupNorm(4, 32),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.GroupNorm(8, 64),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-        )
-        self.policy_head = nn.Conv2d(64, 1, 1)
-        self.value_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-        self.mine_head = nn.Conv2d(64, 1, 1)
-
-    def forward(self, x: torch.Tensor, return_mine: bool = False):
-        f = self.backbone(x)  # [B,64,H,W]
-        logits_1 = self.policy_head(f)  # [B,1,H,W]
-        B, _, H, W = logits_1.shape
-        policy_logits = logits_1.permute(0, 2, 3, 1).reshape(B, H * W)
-        value = self.value_head(f).squeeze(-1)
-        if return_mine:
-            mine_logits = self.mine_head(f)  # [B,1,H,W]
-            return policy_logits, value, mine_logits
-        return policy_logits, value
-
-    # Reveal-only policy: no flag bias controls required
 
 
 class _Attention(nn.Module):
@@ -46,7 +14,7 @@ class _Attention(nn.Module):
         num_heads: int,
         rel_pos_index: Optional[torch.Tensor] = None,
         rel_pos_bins: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.num_heads = num_heads
@@ -68,11 +36,11 @@ class _Attention(nn.Module):
         qkv = self.qkv(x)
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn_mask = None
         if self.rel_pos_bias is not None and self.rel_pos_index is not None:
-            bias = self.rel_pos_bias[:, self.rel_pos_index]  # [H,N,N]
+            bias = self.rel_pos_bias[:, self.rel_pos_index]
             attn_mask = bias.unsqueeze(0).to(dtype=q.dtype, device=q.device)
 
         out = F.scaled_dot_product_attention(
@@ -88,7 +56,7 @@ class _Attention(nn.Module):
 
 
 class _TransformerMLP(nn.Module):
-    def __init__(self, dim: int, mlp_ratio: float):
+    def __init__(self, dim: int, mlp_ratio: float) -> None:
         super().__init__()
         hidden = int(dim * mlp_ratio)
         self.fc1 = nn.Linear(dim, hidden)
@@ -107,7 +75,7 @@ class _TransformerBlock(nn.Module):
         mlp_ratio: float,
         rel_pos_index: Optional[torch.Tensor] = None,
         rel_pos_bins: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = _Attention(dim, num_heads, rel_pos_index, rel_pos_bins)
@@ -120,7 +88,7 @@ class _TransformerBlock(nn.Module):
         return x
 
 
-def _build_rel_pos_index(H: int, W: int, radius: Optional[int]) -> tuple[Optional[torch.Tensor], Optional[int]]:
+def _build_rel_pos_index(H: int, W: int, radius: Optional[int]) -> Tuple[Optional[torch.Tensor], Optional[int]]:
     if radius is None or radius <= 0:
         return None, None
     coords = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij"), dim=-1)
@@ -135,7 +103,6 @@ def _build_rel_pos_index(H: int, W: int, radius: Optional[int]) -> tuple[Optiona
     rel_index = torch.where(far_mask, torch.full_like(rel_index, far_bin), rel_index)
     rel_pos_bins = far_bin + 1
     return rel_index, rel_pos_bins
-
 
 
 class TransformerPolicy(nn.Module):
@@ -155,7 +122,8 @@ class TransformerPolicy(nn.Module):
         tie_reveal_to_belief: bool = False,
         num_global_tokens: int = 2,
         mlp_ratio_last: float | None = None,
-    ):
+        cascade_gamma: float = 1.0,
+    ) -> None:
         super().__init__()
         self.H, self.W = board_shape
         self.N = self.H * self.W
@@ -166,9 +134,10 @@ class TransformerPolicy(nn.Module):
         self.tie_reveal_to_belief = bool(tie_reveal_to_belief)
         self.num_global_tokens = max(0, int(num_global_tokens))
         self.gradient_checkpointing = False
-        self._last_beta_reg = None
+        self._last_beta_reg: Optional[torch.Tensor] = None
+        self.cascade_gamma = float(cascade_gamma)
 
-        token_dim = 1 + 9  # revealed + counts
+        token_dim = 1 + 9
         if include_flags_channel:
             token_dim += 1
         if include_frontier_channel:
@@ -183,7 +152,7 @@ class TransformerPolicy(nn.Module):
         if self.num_global_tokens > 0:
             self.global_tokens = nn.Parameter(torch.zeros(1, self.num_global_tokens, d_model))
         else:
-            self.register_parameter('global_tokens', None)
+            self.register_parameter("global_tokens", None)
 
         self.row_embed = nn.Parameter(torch.randn(self.H, d_model) * 0.02)
         self.col_embed = nn.Parameter(torch.randn(self.W, d_model) * 0.02)
@@ -194,24 +163,23 @@ class TransformerPolicy(nn.Module):
             far_bin = rel_pos_bins - 1
             rel_full = torch.full((total_tokens, total_tokens), far_bin, dtype=torch.long)
             rel_full[1 : self.N + 1, 1 : self.N + 1] = rel_pos_index
-            self.register_buffer('rel_pos_index', rel_full, persistent=False)
+            self.register_buffer("rel_pos_index", rel_full, persistent=False)
             self.rel_pos_bins = rel_pos_bins
         else:
-            self.register_buffer('rel_pos_index', None, persistent=False)
+            self.register_buffer("rel_pos_index", None, persistent=False)
             self.rel_pos_bins = None
 
-        blocks: list[_TransformerBlock] = []
+        blocks = []
         for i in range(depth):
-            block_rel_index = self.rel_pos_index if i % 2 == 0 else None
-            block_rel_bins = self.rel_pos_bins if i % 2 == 0 else None
-            block_mlp_ratio = mlp_ratio_last if (mlp_ratio_last is not None and i >= depth - 2) else mlp_ratio
+            rel_idx = self.rel_pos_index if rel_pos_index is not None else None
+            rel_bins = self.rel_pos_bins if rel_pos_index is not None else None
             blocks.append(
                 _TransformerBlock(
                     d_model,
                     num_heads,
-                    block_mlp_ratio,
-                    rel_pos_index=block_rel_index,
-                    rel_pos_bins=block_rel_bins,
+                    mlp_ratio if (mlp_ratio_last is None or i < depth - 1) else mlp_ratio_last,
+                    rel_idx,
+                    rel_bins,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -243,19 +211,25 @@ class TransformerPolicy(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
+        self.cascade_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
 
         rows = torch.arange(self.H)
         cols = torch.arange(self.W)
-        rr, cc = torch.meshgrid(rows, cols, indexing='ij')
-        self.register_buffer('row_ids', rr.reshape(-1), persistent=False)
-        self.register_buffer('col_ids', cc.reshape(-1), persistent=False)
+        rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+        self.register_buffer("row_ids", rr.reshape(-1), persistent=False)
+        self.register_buffer("col_ids", cc.reshape(-1), persistent=False)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = bool(enabled)
 
     def _tokens_from_obs(self, obs: torch.Tensor) -> torch.Tensor:
         B, C, H, W = obs.shape
-        assert H == self.H and W == self.W, 'Observation spatial dims mismatch'
+        assert H == self.H and W == self.W, "Observation spatial dims mismatch"
         offset = 0
         revealed = obs[:, offset : offset + 1]
         offset += 1
@@ -313,37 +287,43 @@ class TransformerPolicy(nn.Module):
             if self.gradient_checkpointing and self.training:
                 try:
                     x = checkpoint(blk, x, use_reentrant=False)
-                except TypeError:
+                except TypeError:  # pragma: no cover - PyTorch < 2.0 fallback
                     x = checkpoint(blk, x)
             else:
                 x = blk(x)
         x = self.norm(x)
 
-        start_idx = 1 + self.num_global_tokens
-        cls_token = x[:, :1]
-        global_states = x[:, 1:start_idx] if self.num_global_tokens > 0 else None
-        token_states = x[:, start_idx:]
-
-        mine_logits_flat = None
+        cls_token, token_states = x[:, :1], x[:, 1 : self.N + 1]
         mine_logits_map = None
-        need_mine = self.tie_reveal_to_belief or return_mine
-        if need_mine:
+        cascade_logits_map = None
+        need_aux = self.tie_reveal_to_belief or return_mine
+        if need_aux:
             mine_logits_flat = self.mine_head(token_states).squeeze(-1)
+            cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
             mine_logits_map = mine_logits_flat.view(B, 1, self.H, self.W)
+            cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
+        else:
+            mine_logits_flat = None
+            cascade_logits_flat = None
 
         if self.tie_reveal_to_belief:
-            if mine_logits_flat is None:
-                mine_logits_flat = self.mine_head(token_states).squeeze(-1)
-                mine_logits_map = mine_logits_flat.view(B, 1, self.H, self.W)
-            if global_states is not None:
-                pooled = torch.cat([cls_token, global_states], dim=1).mean(dim=1)
+            assert self.belief_policy_proj is not None
+            if global_tokens is not None:
+                pooled = torch.cat([cls_token, global_tokens], dim=1).mean(dim=1)
             else:
                 pooled = cls_token.squeeze(1)
             params = self.belief_policy_proj(pooled)
             beta_raw, bias = params.split(1, dim=-1)
             beta = F.softplus(beta_raw) + 1e-3
             self._last_beta_reg = (beta ** 2).mean()
-            policy_logits_flat = (-beta * mine_logits_flat + bias).view(B, self.N)
+            mine_probs = torch.sigmoid(mine_logits_flat)
+            if cascade_logits_flat is None:
+                cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
+                cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
+            cascade_expect = F.softplus(cascade_logits_flat)
+            policy_logits_flat = (
+                -beta * mine_probs + self.cascade_gamma * cascade_expect + bias
+            ).view(B, self.N)
         else:
             self._last_beta_reg = None
             logits_tokens = self.policy_head(token_states).squeeze(-1)
@@ -355,41 +335,13 @@ class TransformerPolicy(nn.Module):
             if mine_logits_map is None:
                 mine_logits_flat = self.mine_head(token_states).squeeze(-1)
                 mine_logits_map = mine_logits_flat.view(B, 1, self.H, self.W)
-            return policy_logits_flat, value, mine_logits_map
+            if cascade_logits_map is None:
+                cascade_logits_flat = self.cascade_head(token_states).squeeze(-1)
+                cascade_logits_map = cascade_logits_flat.view(B, 1, self.H, self.W)
+            return policy_logits_flat, value, (mine_logits_map, cascade_logits_map)
         return policy_logits_flat, value
 
     def beta_regularizer(self) -> torch.Tensor:
         if self._last_beta_reg is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self._last_beta_reg
-
-
-
-def build_model(
-    name: str,
-    *,
-    obs_shape: tuple[int, int, int],
-    env_overrides: Dict[str, bool] | None = None,
-    model_cfg: Optional[dict] = None,
-) -> nn.Module:
-    env_overrides = env_overrides or {}
-    model_cfg = model_cfg or {}
-    if name == "cnn":
-        in_channels = obs_shape[0]
-        hidden = int(model_cfg.get("hidden", 64))
-        return CNNPolicy(in_channels=in_channels, hidden=hidden)
-    if name == "transformer":
-        H, W = obs_shape[1], obs_shape[2]
-        include_flags_channel = bool(env_overrides.get("include_flags_channel", False))
-        include_frontier_channel = bool(env_overrides.get("include_frontier_channel", False))
-        include_remaining_mines_channel = bool(env_overrides.get("include_remaining_mines_channel", False))
-        include_progress_channel = bool(env_overrides.get("include_progress_channel", False))
-        cfg = {
-            "include_flags_channel": include_flags_channel,
-            "include_frontier_channel": include_frontier_channel,
-            "include_remaining_mines_channel": include_remaining_mines_channel,
-            "include_progress_channel": include_progress_channel,
-        }
-        cfg.update(model_cfg)
-        return TransformerPolicy((H, W), **cfg)
-    raise ValueError(f"Unknown model name: {name}")

@@ -185,7 +185,11 @@ def debug_eval(
             mask = torch.ones_like(mask)
 
         if use_controller:
-            logits, _, mine_logits = model(obs, return_mine=True)
+            logits, _, aux_maps = model(obs, return_mine=True)
+            if isinstance(aux_maps, tuple):
+                mine_logits = aux_maps[0]
+            else:
+                mine_logits = aux_maps
         else:
             logits, _ = model(obs)
             mine_logits = None
@@ -300,7 +304,11 @@ def evaluate(
                 half = mask.shape[-1] // 2
                 mask[:, half:] = False
             if use_controller:
-                logits, _, mine_logits = model(obs, return_mine=True)
+                logits, _, aux_maps = model(obs, return_mine=True)
+                if isinstance(aux_maps, tuple):
+                    mine_logits = aux_maps[0]
+                else:
+                    mine_logits = aux_maps
             else:
                 logits, _ = model(obs)
                 mine_logits = None
@@ -410,7 +418,11 @@ def evaluate_vec(
                 if empty_rows.any():
                     mask[empty_rows] = True
 
-                logits, _, mine_logits = model(obs, return_mine=True)
+                logits, _, aux_maps = model(obs, return_mine=True)
+                if isinstance(aux_maps, tuple):
+                    mine_logits = aux_maps[0]
+                else:
+                    mine_logits = aux_maps
                 _assert_action_space(mask, logits, vec.envs[0])
 
                 masked_logits = logits.masked_fill(~mask, -1e9)

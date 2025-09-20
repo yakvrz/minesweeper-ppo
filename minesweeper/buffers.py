@@ -33,6 +33,7 @@ class RolloutBuffer:
         # optional labels for auxiliary mine head
         self.mine_labels = None  # set externally if used; shape [B, H, W]
         self.mine_valid = None   # mask indicating cells contributing to the aux loss
+        self.cascade_targets = None  # expected cascade size for chosen action
 
         self._t = 0
 
@@ -47,6 +48,7 @@ class RolloutBuffer:
         values: torch.Tensor,
         mine_labels: torch.Tensor | None = None,
         mine_valid: torch.Tensor | None = None,
+        cascade_targets: torch.Tensor | None = None,
     ) -> None:
         bsz = obs.shape[0]
         s = self._t * bsz
@@ -74,6 +76,14 @@ class RolloutBuffer:
                         device=self.device,
                     )
                 self.mine_valid[s:e] = mine_valid
+        if cascade_targets is not None:
+            if self.cascade_targets is None:
+                self.cascade_targets = torch.zeros(
+                    (self.num_envs * self.steps,),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            self.cascade_targets[s:e] = cascade_targets
         self._t += 1
 
     def compute_gae(self, last_values: torch.Tensor, gamma: float = 0.995, lam: float = 0.95) -> None:
@@ -115,6 +125,7 @@ class RolloutBuffer:
                 batch["mine_labels"] = self.mine_labels[sel]
                 if self.mine_valid is not None:
                     batch["mine_valid"] = self.mine_valid[sel]
+            if self.cascade_targets is not None:
+                batch["cascade_targets"] = self.cascade_targets[sel]
             # simple object with attribute access
             yield type("Batch", (), {k: v for k, v in batch.items()})
-
