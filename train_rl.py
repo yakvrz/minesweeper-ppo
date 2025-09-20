@@ -407,6 +407,19 @@ def main() -> None:
     per_update_rows = []
     best_quick_score = float('-inf')
     best_quick_metrics: dict[str, float] | None = None
+    best_ckpt_path: str | None = None
+    best_update = -1
+    stopped_early = False
+    early_stop_patience = None
+    if isinstance(training_opts, dict):
+        patience_val = training_opts.get("early_stop_patience")
+        if patience_val is not None:
+            try:
+                patience_int = int(patience_val)
+                if patience_int > 0:
+                    early_stop_patience = patience_int
+            except Exception:
+                pass
 
     for update in progress:
         if cfg.ent_decay_updates > 0:
@@ -528,7 +541,7 @@ def main() -> None:
                     float(auroc) if auroc is not None else float('nan'),
                     score,
                 )
-                if score > best_quick_score:
+                if score > best_quick_score or best_update < 0:
                     best_quick_score = score
                     best_quick_metrics = metrics_quick
                     ckpt_best = os.path.join(args.out, "ckpt_best.pt")
@@ -539,8 +552,24 @@ def main() -> None:
                         "model_meta": model_meta,
                     }
                     torch.save(payload_best, ckpt_best)
+                    best_ckpt_path = ckpt_best
+                    best_update = update + 1
+                if early_stop_patience is not None and best_update >= 0:
+                    updates_since_best = (update + 1) - best_update
+                    if updates_since_best >= early_stop_patience:
+                        stopped_early = True
+                        log.info(
+                            "Early stopping triggered at update %d (best score %.3f at update %d, patience=%d)",
+                            update + 1,
+                            best_quick_score,
+                            best_update,
+                            early_stop_patience,
+                        )
+                        break
             except Exception as exc:  # pragma: no cover - best effort
                 log.warning(f"Quick eval failed at update {update+1}: {exc}")
+        if stopped_early:
+            break
 
     # Export per-update CSV
     try:
@@ -562,6 +591,21 @@ def main() -> None:
     }
     torch.save(payload_final, ckpt_final)
     last_ckpt = ckpt_final
+
+    eval_checkpoint_path = best_ckpt_path if best_ckpt_path and os.path.exists(best_ckpt_path) else ckpt_final
+    if eval_checkpoint_path != ckpt_final:
+        try:
+            state = torch.load(eval_checkpoint_path, map_location=device)
+            state_dict = state.get("model", state)
+            # ensure keys align after potential compile wrapping
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict, strict=False)
+            last_ckpt = eval_checkpoint_path
+            log.info("Loaded best checkpoint %s for final evaluation", eval_checkpoint_path)
+        except Exception as exc:  # pragma: no cover - fallback to final weights
+            log.warning("Failed to load best checkpoint %s: %s", eval_checkpoint_path, exc)
+            last_ckpt = ckpt_final
 
     # End-of-training evaluation
     try:
@@ -585,6 +629,10 @@ def main() -> None:
             "eval_pairs": args.eval_pairs,
             "best_quick_metrics": best_quick_metrics,
             "best_quick_score": best_quick_score,
+            "best_checkpoint": os.path.basename(best_ckpt_path) if best_ckpt_path else None,
+            "best_update": best_update,
+            "stopped_early": stopped_early,
+            "early_stop_patience": early_stop_patience,
         }
         with open(os.path.join(args.out, "summary.json"), "w") as f:
             json.dump(summary, f)
