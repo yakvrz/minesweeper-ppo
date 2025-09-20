@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple, Optional
 import numpy as np
 from collections import deque
 
+from .env_numba import HAS_ENV_NUMBA, flood_fill_reveal
 from .rules import forced_moves
 
 
@@ -50,7 +51,11 @@ class MinesweeperEnv:
         self._obs_buffer = np.zeros((self._obs_channel_count, self.H, self.W), dtype=np.float32)
         self._onehot_buffer = np.zeros((9, self.H, self.W), dtype=np.float32)
         self._frontier_buffer = np.zeros((self.H, self.W), dtype=bool)
+        self._pad_buffer = np.zeros((self.H + 2, self.W + 2), dtype=bool)
         self._shift_buffer = np.zeros((self.H, self.W), dtype=bool)
+        self._forbidden_buffer = np.zeros((self.H, self.W), dtype=bool)
+        self._mine_pad_buffer = np.zeros((self.H + 2, self.W + 2), dtype=np.uint8)
+        self._adjacent_work = np.zeros((self.H, self.W), dtype=np.uint8)
         self._neighbor_offsets = tuple(
             (dr, dc)
             for dr in (-1, 0, 1)
@@ -218,10 +223,26 @@ class MinesweeperEnv:
         return unrevealed.reshape(-1).astype(bool, copy=False)
 
     def _reveal_with_flood_fill(self, r: int, c: int) -> int:
-        """Reveal cell (r,c). If zero, BFS flood-fill reveals connected zero region
-        and its border number cells. Respects flags (does not auto-unflag).
-        Returns number of newly revealed safe cells.
-        """
+        """Reveal cell (r,c) with flood-fill expansion for zero tiles."""
+        if self.revealed[r, c] or self.flags[r, c]:
+            return 0
+
+        if HAS_ENV_NUMBA:
+            return int(
+                flood_fill_reveal(
+                    self.revealed,
+                    self.flags,
+                    self.mine_mask,
+                    self.adjacent_counts,
+                    int(r),
+                    int(c),
+                )
+            )
+
+        return self._reveal_with_flood_fill_python(r, c)
+
+    def _reveal_with_flood_fill_python(self, r: int, c: int) -> int:
+        """Python fallback flood-fill used when numba acceleration is unavailable."""
         if self.revealed[r, c] or self.flags[r, c]:
             return 0
 
@@ -234,7 +255,6 @@ class MinesweeperEnv:
             if self.revealed[rr, cc] or self.flags[rr, cc]:
                 continue
             if self.mine_mask[rr, cc]:
-                # safety: should not happen for non-mine reveals unless inconsistent call
                 continue
             self.revealed[rr, cc] = True
             newly_revealed += 1
@@ -290,9 +310,18 @@ class MinesweeperEnv:
         number_cells = self.revealed & (self.adjacent_counts > 0)
         if not number_cells.any():
             return frontier
-        for dr, dc in self._neighbor_offsets:
-            shifted = self._shift_bool(number_cells, dr, dc, out=self._shift_buffer)
-            frontier |= shifted
+        pad = self._pad_buffer
+        pad.fill(False)
+        pad[1:-1, 1:-1] = number_cells
+
+        np.logical_or(frontier, pad[:-2, :-2], out=frontier)
+        np.logical_or(frontier, pad[:-2, 1:-1], out=frontier)
+        np.logical_or(frontier, pad[:-2, 2:], out=frontier)
+        np.logical_or(frontier, pad[1:-1, :-2], out=frontier)
+        np.logical_or(frontier, pad[1:-1, 2:], out=frontier)
+        np.logical_or(frontier, pad[2:, :-2], out=frontier)
+        np.logical_or(frontier, pad[2:, 1:-1], out=frontier)
+        np.logical_or(frontier, pad[2:, 2:], out=frontier)
         unknown = (~self.revealed) & (~self.flags)
         frontier &= unknown
         return frontier
@@ -311,32 +340,55 @@ class MinesweeperEnv:
         total = H * W
         mines = int(self.cfg.mine_count)
 
-        forbidden = np.zeros((H, W), dtype=bool)
-        forbidden[r0, c0] = True
+        forbidden = self._forbidden_buffer
+        forbidden.fill(False)
         if self.cfg.guarantee_safe_neighborhood:
-            for rr, cc in self._neighbors(r0, c0, include_self=False, include_diagonals=True):
-                forbidden[rr, cc] = True
+            pad = self._pad_buffer
+            pad.fill(False)
+            pad[1 + r0, 1 + c0] = True
+            np.logical_or(forbidden, pad[:-2, :-2], out=forbidden)
+            np.logical_or(forbidden, pad[:-2, 1:-1], out=forbidden)
+            np.logical_or(forbidden, pad[:-2, 2:], out=forbidden)
+            np.logical_or(forbidden, pad[1:-1, :-2], out=forbidden)
+            np.logical_or(forbidden, pad[1:-1, 2:], out=forbidden)
+            np.logical_or(forbidden, pad[2:, :-2], out=forbidden)
+            np.logical_or(forbidden, pad[2:, 1:-1], out=forbidden)
+            np.logical_or(forbidden, pad[2:, 2:], out=forbidden)
+        forbidden[r0, c0] = True
 
-        allowed_indices = (~forbidden).reshape(-1).nonzero()[0]
+        allowed_indices = np.flatnonzero(~forbidden)
         if len(allowed_indices) < mines:
             # In tiny boards with strong safety, relax to at least exclude the clicked cell
-            forbidden = np.zeros((H, W), dtype=bool)
+            forbidden.fill(False)
             forbidden[r0, c0] = True
-            allowed_indices = (~forbidden).reshape(-1).nonzero()[0]
+            allowed_indices = np.flatnonzero(~forbidden)
 
         mine_positions = self.rng.choice(allowed_indices, size=mines, replace=False)
-        self.mine_mask = np.zeros((H, W), dtype=bool)
+        self.mine_mask.fill(False)
         self.mine_mask.reshape(-1)[mine_positions] = True
-        self.adjacent_counts = self._compute_adjacent_counts(self.mine_mask)
+        self._compute_adjacent_counts(self.mine_mask, out=self.adjacent_counts)
 
-    def _compute_adjacent_counts(self, mine_mask: np.ndarray) -> np.ndarray:
-        counts = np.zeros_like(mine_mask, dtype=np.uint8)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                shifted = self._shift_bool(mine_mask, dr, dc, out=self._shift_buffer)
-                np.add(counts, shifted, out=counts, casting="unsafe")
+    def _compute_adjacent_counts(
+        self, mine_mask: np.ndarray, *, out: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        pad = self._mine_pad_buffer
+        pad.fill(0)
+        pad[1:-1, 1:-1] = mine_mask
+
+        if out is None:
+            counts = np.zeros_like(mine_mask, dtype=np.uint8)
+        else:
+            counts = out
+            counts.fill(0)
+
+        np.add(counts, pad[:-2, :-2], out=counts, casting="unsafe")
+        np.add(counts, pad[:-2, 1:-1], out=counts, casting="unsafe")
+        np.add(counts, pad[:-2, 2:], out=counts, casting="unsafe")
+        np.add(counts, pad[1:-1, :-2], out=counts, casting="unsafe")
+        np.add(counts, pad[1:-1, 2:], out=counts, casting="unsafe")
+        np.add(counts, pad[2:, :-2], out=counts, casting="unsafe")
+        np.add(counts, pad[2:, 1:-1], out=counts, casting="unsafe")
+        np.add(counts, pad[2:, 2:], out=counts, casting="unsafe")
         return counts
 
     def _neighbors(

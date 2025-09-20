@@ -167,9 +167,16 @@ def collect_rollout(
         mine_labels_gpu = torch.zeros((num_envs, H, W), dtype=torch.float32, device=device)
         mine_valid_gpu = torch.zeros((num_envs, H, W), dtype=torch.bool, device=device)
 
+    tensor_bridge_time = 0.0
+    mine_label_copy_time = 0.0
+    env_step_time = 0.0
+    model_forward_time = 0.0
+
     for _ in range(steps):
+        t_bridge = time.perf_counter()
         obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
         mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+        tensor_bridge_time += time.perf_counter() - t_bridge
         mine_labels_tensor = None
         mine_valid_tensor = None
         if need_aux:
@@ -183,25 +190,35 @@ def collect_rollout(
                     mine_labels_np[i].fill(0.0)
                     mine_valid_np[i].fill(False)
             if any_labels:
+                t_labels = time.perf_counter()
                 mine_labels_gpu.copy_(mine_labels_cpu, non_blocking=True)
                 mine_valid_gpu.copy_(mine_valid_cpu, non_blocking=True)
+                mine_label_copy_time += time.perf_counter() - t_labels
                 mine_labels_tensor = mine_labels_gpu
                 mine_valid_tensor = mine_valid_gpu
 
+        t_model = time.perf_counter()
         if need_aux:
             logits, values, _ = model(obs, return_mine=True)
         else:
             logits, values = model(obs)
+        model_forward_time += time.perf_counter() - t_model
         logits = logits.masked_fill(~mask, -1e9)
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
         logp = dist.log_prob(actions)
 
+        t_bridge = time.perf_counter()
         actions_np = actions.cpu().numpy().astype(np.int32)
+        tensor_bridge_time += time.perf_counter() - t_bridge
+        t_env = time.perf_counter()
         batch, rewards_np, dones_np, infos = vec.step(actions_np)
+        env_step_time += time.perf_counter() - t_env
 
+        t_bridge = time.perf_counter()
         rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
         dones = torch.from_numpy(dones_np).to(device=device, dtype=torch.bool)
+        tensor_bridge_time += time.perf_counter() - t_bridge
         buffer.add(
             obs.detach(),
             mask.detach(),
@@ -220,14 +237,27 @@ def collect_rollout(
         if invalid_rows.any():
             mask_np[invalid_rows] = True
 
+    t_bridge = time.perf_counter()
     obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
     mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+    tensor_bridge_time += time.perf_counter() - t_bridge
     with torch.no_grad():
         if aux_mine_weight > 0:
             _, last_values, _ = model(obs, return_mine=True)
         else:
             _, last_values = model(obs)
-    return buffer, {"last_values": last_values}
+    timings = {
+        "steps": steps,
+        "tensor_bridge_total_s": tensor_bridge_time,
+        "tensor_bridge_per_step_ms": (tensor_bridge_time / steps) * 1000.0 if steps else 0.0,
+        "mine_label_copy_total_s": mine_label_copy_time,
+        "mine_label_copy_per_step_ms": (mine_label_copy_time / steps) * 1000.0 if steps else 0.0,
+        "env_step_total_s": env_step_time,
+        "env_step_per_step_ms": (env_step_time / steps) * 1000.0 if steps else 0.0,
+        "model_forward_total_s": model_forward_time,
+        "model_forward_per_step_ms": (model_forward_time / steps) * 1000.0 if steps else 0.0,
+    }
+    return buffer, {"last_values": last_values, "timings": timings}
 
 
 def main() -> None:

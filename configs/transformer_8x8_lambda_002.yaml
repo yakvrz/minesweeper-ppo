@@ -2,7 +2,7 @@ env:
   H: 8
   W: 8
   guarantee_safe_neighborhood: true
-  include_flags_channel: true
+  include_flags_channel: false
   include_frontier_channel: true
   include_progress_channel: true
   include_remaining_mines_channel: true
@@ -34,4 +34,4 @@ ppo:
   vf_coef: 0.5
   aux_mine_weight: 0.02
 training:
-  beta_l2: 0.0
+  beta_l2: 0.0001
