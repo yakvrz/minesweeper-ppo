@@ -110,23 +110,20 @@ def forced_moves(state) -> List[Tuple[str, int]]:
             for act, idx in zip(actions, indices)
         ]
 
+    use_pair = getattr(getattr(state, "cfg", None), "use_pair_constraints", True)
+
     moves = _forced_moves_numpy(revealed, flags, counts)
     if not moves and _HAS_TORCH:
         actions, indices = _forced_moves_torch(revealed, flags, counts)
         moves = [("reveal" if act == 2 else "flag", int(idx)) for act, idx in zip(actions, indices)]
 
-    if moves:
+    if not moves:
+        moves = _forced_moves_py(revealed, flags, counts)
+
+    if use_pair and moves:
         moves = _apply_pair_constraints(revealed, flags, counts, moves)
-        return moves
 
-    if _HAS_TORCH:
-        actions, indices = _forced_moves_torch(revealed, flags, counts)
-        moves = [("reveal" if act == 2 else "flag", int(idx)) for act, idx in zip(actions, indices)]
-        if moves:
-            moves = _apply_pair_constraints(revealed, flags, counts, moves)
-            return moves
-
-    return _apply_pair_constraints(revealed, flags, counts, _forced_moves_py(revealed, flags, counts))
+    return moves
 
 
 def _forced_moves_py(revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray) -> List[Tuple[str, int]]:

@@ -16,6 +16,7 @@ class EnvConfig:
     W: int = 8
     mine_count: int = 10
     guarantee_safe_neighborhood: bool = True
+    use_pair_constraints: bool = True
 
     win_reward: float = 1.0
     loss_reward: float = -1.0
