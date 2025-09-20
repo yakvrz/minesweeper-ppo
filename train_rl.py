@@ -118,6 +118,7 @@ class PPOTrainConfig:
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     aux_mine_weight: float = 0.0
+    aux_mine_calib_weight: float = 0.0
     total_updates: int = 1000
 
 
@@ -150,6 +151,7 @@ def load_config(cfg_path: str | None) -> tuple[PPOTrainConfig, dict, dict, dict]
         lr=ppo_d.get("lr", base.lr),
         max_grad_norm=ppo_d.get("max_grad_norm", base.max_grad_norm),
         aux_mine_weight=ppo_d.get("aux_mine_weight", base.aux_mine_weight),
+        aux_mine_calib_weight=ppo_d.get("aux_mine_calib_weight", base.aux_mine_calib_weight),
         total_updates=ppo_d.get("total_updates", base.total_updates),
     )
     extras = {k: v for k, v in data.items() if k not in ("env", "ppo", "model")}
@@ -171,6 +173,7 @@ def collect_rollout(
     steps: int,
     device: torch.device,
     aux_mine_weight: float = 0.0,
+    aux_mine_calib_weight: float = 0.0,
 ) -> tuple[RolloutBuffer, Dict]:
     batch = vec.reset()
     obs_np = batch["obs"]
@@ -185,11 +188,12 @@ def collect_rollout(
     buffer = RolloutBuffer(num_envs=num_envs, steps=steps, obs_shape=(C, H, W), action_dim=action_dim, device=device)
 
     need_aux_mine = aux_mine_weight > 0
-    need_aux_maps = need_aux_mine
+    need_aux_calib = aux_mine_calib_weight > 0
+    need_aux_maps = need_aux_mine or need_aux_calib
     mine_labels_np = mine_valid_np = None
     mine_labels_cpu = mine_valid_cpu = None
     mine_labels_gpu = mine_valid_gpu = None
-    if need_aux_mine:
+    if need_aux_maps:
         mine_labels_np = np.zeros((num_envs, H, W), dtype=np.float32)
         mine_valid_np = np.zeros((num_envs, H, W), dtype=bool)
         mine_labels_cpu = torch.from_numpy(mine_labels_np)
@@ -211,7 +215,7 @@ def collect_rollout(
         tensor_bridge_time += time.perf_counter() - t_bridge
         mine_labels_tensor = None
         mine_valid_tensor = None
-        if need_aux_mine:
+        if need_aux_maps:
             any_labels = False
             for i, env in enumerate(vec.envs):
                 if env.first_click_done:
@@ -355,7 +359,19 @@ def main() -> None:
     }
     env_kwargs.update(env_overrides)
     env_cfg = EnvConfig(**env_kwargs)
-    vec = VecMinesweeper(num_envs=cfg.num_envs, cfg=env_cfg, seed=args.seed)
+    late_start_cfg = None
+    if isinstance(training_opts, dict):
+        ls_opts = training_opts.get("late_start")
+        if isinstance(ls_opts, dict):
+            late_start_cfg = dict(ls_opts)
+
+    vec = VecMinesweeper(
+        num_envs=cfg.num_envs,
+        cfg=env_cfg,
+        seed=args.seed,
+        late_start_cfg=late_start_cfg,
+        late_start_seed=args.seed + 1,
+    )
 
     dummy = vec.reset()
     in_channels = dummy["obs"].shape[1]
@@ -424,6 +440,7 @@ def main() -> None:
         vf_coef=cfg.vf_coef,
         ent_coef=cfg.ent_coef,
         aux_mine_weight=cfg.aux_mine_weight,
+        aux_mine_calib_weight=cfg.aux_mine_calib_weight,
         max_grad_norm=cfg.max_grad_norm,
         beta_l2=beta_l2,
         adv_guess_weight=0.0,
@@ -546,6 +563,7 @@ def main() -> None:
             steps=cfg.steps_per_env,
             device=device,
             aux_mine_weight=current_aux_weight,
+            aux_mine_calib_weight=ppo_cfg.aux_mine_calib_weight,
         )
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
@@ -554,6 +572,8 @@ def main() -> None:
         loss_sum = policy_sum = value_sum = ent_sum = 0.0
         aux_sum = 0.0
         aux_count = 0
+        calib_sum = 0.0
+        calib_count = 0
         count = 0
         for _ in range(cfg.ppo_epochs):
             for batch in buffer.get_minibatches(minibatch_size):
@@ -566,6 +586,9 @@ def main() -> None:
                 if "aux_bce" in stats:
                     aux_sum += stats["aux_bce"]
                     aux_count += 1
+                if "aux_calib" in stats:
+                    calib_sum += stats["aux_calib"]
+                    calib_count += 1
 
         sched.step()
         dt = time.time() - t0
@@ -575,13 +598,16 @@ def main() -> None:
             val_avg = value_sum / count
             ent_avg = ent_sum / count
             aux_avg = aux_sum / max(1, aux_count) if aux_count > 0 else float("nan")
+            calib_avg = calib_sum / max(1, calib_count) if calib_count > 0 else float("nan")
         else:
-            loss_avg = pol_avg = val_avg = ent_avg = aux_avg = float('nan')
+            loss_avg = pol_avg = val_avg = ent_avg = aux_avg = calib_avg = float('nan')
 
         steps_this_update = cfg.num_envs * cfg.steps_per_env
         extra_terms = []
         if aux_count > 0:
             extra_terms.append(f"aux_mine={aux_avg:.4f}")
+        if calib_count > 0:
+            extra_terms.append(f"aux_calib={calib_avg:.4f}")
         aux_str = f" {' '.join(extra_terms)}" if extra_terms else ""
         log.info(
             f"upd {update+1}/{cfg.total_updates} | {dt:.2f}s | steps={steps_this_update} | "
@@ -599,6 +625,7 @@ def main() -> None:
             "entropy": float(ent_avg),
             "ent_coef": float(current_ent_coef),
             "aux_bce": float(aux_avg) if aux_count > 0 else None,
+            "aux_calib": float(calib_avg) if calib_count > 0 else None,
             "aux_weight": float(current_aux_weight),
             "quick_win_rate": None,
             "quick_guesses_per_ep": None,

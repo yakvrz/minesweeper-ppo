@@ -15,6 +15,7 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.003
     aux_mine_weight: float = 0.0
+    aux_mine_calib_weight: float = 0.0
     max_grad_norm: float = 0.5
     beta_l2: float = 0.0
     adv_guess_weight: float = 0.0
@@ -24,7 +25,8 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
     use_cuda = batch.obs.is_cuda
     autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
     with autocast_ctx:
-        if cfg.aux_mine_weight > 0:
+        need_mine_head = cfg.aux_mine_weight > 0 or cfg.aux_mine_calib_weight > 0
+        if need_mine_head:
             logits, value, mine_logits = model(batch.obs, return_mine=True)
         else:
             logits, value = model(batch.obs, return_mine=False)
@@ -53,7 +55,8 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
         loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * ent
 
         aux_bce = None
-        if cfg.aux_mine_weight > 0 and hasattr(batch, "mine_labels") and mine_logits is not None:
+        calib_loss = None
+        if need_mine_head and hasattr(batch, "mine_labels") and mine_logits is not None:
             logits_flat = mine_logits.squeeze(1)
             labels = batch.mine_labels
             mask = getattr(batch, "mine_valid", None)
@@ -64,16 +67,25 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
             if valid_labels.numel() > 0:
                 pos = valid_labels.sum()
                 neg = valid_labels.numel() - pos
-                pos_weight = (neg + 1e-6) / (pos + 1e-6)
-                pos_weight_tensor = torch.full((), float(pos_weight), dtype=valid_logits.dtype, device=valid_logits.device)
-                aux_bce = F.binary_cross_entropy_with_logits(
-                    valid_logits,
-                    valid_labels,
-                    pos_weight=pos_weight_tensor,
-                )
-                loss = loss + cfg.aux_mine_weight * aux_bce
+                if cfg.aux_mine_weight > 0:
+                    pos_weight = (neg + 1e-6) / (pos + 1e-6)
+                    pos_weight_tensor = torch.full((), float(pos_weight), dtype=valid_logits.dtype, device=valid_logits.device)
+                    aux_bce = F.binary_cross_entropy_with_logits(
+                        valid_logits,
+                        valid_labels,
+                        pos_weight=pos_weight_tensor,
+                    )
+                    loss = loss + cfg.aux_mine_weight * aux_bce
+                if cfg.aux_mine_calib_weight > 0:
+                    probs = torch.sigmoid(valid_logits)
+                    calib_loss = (probs - valid_labels).pow(2).mean()
+                    loss = loss + cfg.aux_mine_calib_weight * calib_loss
             else:
-                aux_bce = torch.zeros((), dtype=logits_flat.dtype, device=logits_flat.device)
+                zero = torch.zeros((), dtype=logits_flat.dtype, device=logits_flat.device)
+                if cfg.aux_mine_weight > 0:
+                    aux_bce = zero
+                if cfg.aux_mine_calib_weight > 0:
+                    calib_loss = zero
 
         if cfg.beta_l2 > 0 and hasattr(model, "beta_regularizer"):
             beta_pen = model.beta_regularizer()
@@ -112,6 +124,8 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
     }
     if aux_bce is not None:
         stats["aux_bce"] = float(aux_bce.item())
+    if calib_loss is not None:
+        stats["aux_calib"] = float(calib_loss.item())
     if cfg.adv_guess_weight > 0:
         stats["adv_weight"] = float(cfg.adv_guess_weight)
     if adv_penalty_mean is not None:

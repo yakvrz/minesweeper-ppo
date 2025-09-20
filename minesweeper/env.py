@@ -448,7 +448,14 @@ class MinesweeperEnv:
 class VecMinesweeper:
     """Batched wrapper that keeps N independent envs on CPU."""
 
-    def __init__(self, num_envs: int, cfg: EnvConfig, seed: int = 0):
+    def __init__(
+        self,
+        num_envs: int,
+        cfg: EnvConfig,
+        seed: int = 0,
+        late_start_cfg: Optional[Dict[str, Any]] = None,
+        late_start_seed: Optional[int] = None,
+    ):
         assert num_envs > 0
         self.cfg = cfg
         self.num_envs = int(num_envs)
@@ -456,11 +463,82 @@ class VecMinesweeper:
         seeds = base_rng.integers(0, 2**31 - 1, size=self.num_envs, dtype=np.int64)
         self.envs = [MinesweeperEnv(cfg, int(seeds[i])) for i in range(self.num_envs)]
 
+        self._late_start_cfg = late_start_cfg or None
+        self._late_rng: Optional[np.random.Generator]
+        if self._late_start_cfg:
+            ls_seed = late_start_seed if late_start_seed is not None else int(base_rng.integers(0, 2**31 - 1))
+            self._late_rng = np.random.default_rng(ls_seed)
+        else:
+            self._late_rng = None
+
+    # ------------------------ Internal helpers (Vec) ------------------------
+    def _reset_env_state(self, env: MinesweeperEnv) -> Dict[str, Any]:
+        env.reset()
+        if self._late_start_cfg and self._late_rng is not None:
+            self._apply_late_start(env)
+        return {
+            "obs": env._build_obs(),
+            "action_mask": env._compute_action_mask(),
+            "aux": env._build_aux(),
+        }
+
+    def _apply_late_start(self, env: MinesweeperEnv) -> None:
+        cfg = self._late_start_cfg
+        rng = self._late_rng
+        if cfg is None or rng is None:
+            return
+        prob = float(cfg.get("prob", 0.0))
+        if prob <= 0.0 or rng.random() >= prob:
+            return
+
+        min_hidden = int(cfg.get("min_hidden", 5))
+        max_hidden = int(cfg.get("max_hidden", min_hidden))
+        min_hidden = max(1, min_hidden)
+        max_hidden = max(min_hidden, max_hidden)
+        max_attempts = max(1, int(cfg.get("max_attempts", 3)))
+        max_extra_steps = max(1, int(cfg.get("max_extra_steps", env.H * env.W)))
+
+        total_cells = env.H * env.W
+        safe_total = total_cells - int(env.cfg.mine_count)
+
+        for _ in range(max_attempts):
+            # ensure we're starting from a fresh board
+            if env.first_click_done:
+                env.reset()
+
+            # take the first click (guaranteed safe)
+            first_idx = int(rng.integers(0, total_cells))
+            _, _, done, _ = env.step(first_idx)
+            if done:
+                continue
+
+            target_hidden = int(rng.integers(min_hidden, max_hidden + 1))
+            target_hidden = max(1, min(target_hidden, safe_total))
+
+            for _ in range(max_extra_steps):
+                safe_remaining = safe_total - int(env.revealed.sum())
+                if safe_remaining <= target_hidden:
+                    return
+                safe_candidates = np.flatnonzero((~env.mine_mask) & (~env.revealed) & (~env.flags))
+                if safe_candidates.size == 0:
+                    break
+                idx = int(rng.choice(safe_candidates))
+                _, _, done, _ = env.step(idx)
+                if done:
+                    break
+
+            safe_remaining = safe_total - int(env.revealed.sum())
+            if not done and safe_remaining <= target_hidden:
+                return
+
+        # fallback: leave the board fresh if attempts didn't succeed
+        env.reset()
+
     def reset(self) -> Dict[str, np.ndarray]:
         obs_list = []
         mask_list = []
         for e in self.envs:
-            d = e.reset()
+            d = self._reset_env_state(e)
             obs_list.append(d["obs"])  # [C,H,W]
             mask_list.append(d["action_mask"])  # [A]
         obs = np.stack(obs_list, axis=0)
@@ -486,7 +564,7 @@ class VecMinesweeper:
             # auto-reset done envs to streamline rollouts
             d = d_step
             if done:
-                d = e.reset()
+                d = self._reset_env_state(e)
             next_obs.append(d["obs"])  # [C,H,W]
             next_mask.append(d["action_mask"])  # [A]
             rewards[i] = r

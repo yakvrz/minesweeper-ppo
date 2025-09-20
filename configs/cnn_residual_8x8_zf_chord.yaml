@@ -34,6 +34,7 @@ ppo:
   lr: 0.0003
   max_grad_norm: 0.5
   aux_mine_weight: 0.05
+  aux_mine_calib_weight: 0.01
   total_updates: 1200
 
 training:
