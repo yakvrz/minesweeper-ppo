@@ -10,6 +10,7 @@ import csv
 import math
 from dataclasses import dataclass
 from typing import Dict
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -172,6 +173,8 @@ def collect_rollout(
     env_step_time = 0.0
     model_forward_time = 0.0
 
+    use_cuda = device.type == "cuda"
+
     for _ in range(steps):
         t_bridge = time.perf_counter()
         obs = torch.from_numpy(obs_np).to(device=device, dtype=torch.float32)
@@ -198,15 +201,21 @@ def collect_rollout(
                 mine_valid_tensor = mine_valid_gpu
 
         t_model = time.perf_counter()
-        if need_aux:
-            logits, values, _ = model(obs, return_mine=True)
-        else:
-            logits, values = model(obs)
+        model_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
+        with model_ctx:
+            if need_aux:
+                logits, values, _ = model(obs, return_mine=True)
+            else:
+                logits, values = model(obs)
+            # dtype-aware masking constant for stability in half precision
+            neg_inf = -1e9
+            if logits.dtype in (torch.float16, torch.bfloat16):
+                neg_inf = -1e4
+            logits = logits.masked_fill(~mask, neg_inf)
+            dist = torch.distributions.Categorical(logits=logits)
+            actions = dist.sample()
+            logp = dist.log_prob(actions)
         model_forward_time += time.perf_counter() - t_model
-        logits = logits.masked_fill(~mask, -1e9)
-        dist = torch.distributions.Categorical(logits=logits)
-        actions = dist.sample()
-        logp = dist.log_prob(actions)
 
         t_bridge = time.perf_counter()
         actions_np = actions.cpu().numpy().astype(np.int32)
@@ -223,10 +232,10 @@ def collect_rollout(
             obs.detach(),
             mask.detach(),
             actions.detach(),
-            logp.detach(),
+            logp.detach().float(),
             rewards,
             dones,
-            values.detach(),
+            values.detach().float(),
             mine_labels=mine_labels_tensor,
             mine_valid=mine_valid_tensor,
         )
@@ -242,10 +251,12 @@ def collect_rollout(
     mask = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
     tensor_bridge_time += time.perf_counter() - t_bridge
     with torch.no_grad():
-        if aux_mine_weight > 0:
-            _, last_values, _ = model(obs, return_mine=True)
-        else:
-            _, last_values = model(obs)
+        model_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
+        with model_ctx:
+            if aux_mine_weight > 0:
+                _, last_values, _ = model(obs, return_mine=True)
+            else:
+                _, last_values = model(obs)
     timings = {
         "steps": steps,
         "tensor_bridge_total_s": tensor_bridge_time,
@@ -368,6 +379,7 @@ def main() -> None:
                 log.info(f"Loaded init checkpoint from {args.init_ckpt}")
 
     opt = AdamW(model.parameters(), lr=cfg.lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     sched = CosineAnnealingLR(opt, T_max=cfg.total_updates)
     ppo_cfg = PPOConfig(
         clip_eps=cfg.clip_eps,
@@ -377,6 +389,7 @@ def main() -> None:
         aux_mine_weight=cfg.aux_mine_weight,
         max_grad_norm=cfg.max_grad_norm,
         beta_l2=beta_l2,
+        adv_guess_weight=0.0,
     )
 
     progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
@@ -411,6 +424,12 @@ def main() -> None:
     best_update = -1
     stopped_early = False
     early_stop_patience = None
+    aux_base_weight = float(getattr(cfg, "aux_mine_weight", 0.0))
+    aux_warmup_weight = aux_base_weight
+    aux_final_weight = aux_base_weight
+    aux_warmup_updates = 0
+    aux_decay_power = 1.0
+    adv_guess_weight = 0.0
     if isinstance(training_opts, dict):
         patience_val = training_opts.get("early_stop_patience")
         if patience_val is not None:
@@ -420,6 +439,40 @@ def main() -> None:
                     early_stop_patience = patience_int
             except Exception:
                 pass
+
+        warmup_weight_val = training_opts.get("aux_mine_warmup_weight")
+        if warmup_weight_val is not None:
+            try:
+                aux_warmup_weight = float(warmup_weight_val)
+            except Exception:
+                aux_warmup_weight = aux_base_weight
+        final_weight_val = training_opts.get("aux_mine_final_weight")
+        if final_weight_val is not None:
+            try:
+                aux_final_weight = float(final_weight_val)
+            except Exception:
+                aux_final_weight = aux_base_weight
+        warmup_updates_val = training_opts.get("aux_mine_warmup_updates")
+        if warmup_updates_val is not None:
+            try:
+                aux_warmup_updates = max(0, int(warmup_updates_val))
+            except Exception:
+                aux_warmup_updates = 0
+        decay_power_val = training_opts.get("aux_mine_decay_power")
+        if decay_power_val is not None:
+            try:
+                aux_decay_power = max(1e-6, float(decay_power_val))
+            except Exception:
+                aux_decay_power = 1.0
+
+        adv_guess_val = training_opts.get("adv_guess_weight")
+        if adv_guess_val is not None:
+            try:
+                adv_guess_weight = max(0.0, float(adv_guess_val))
+            except Exception:
+                adv_guess_weight = 0.0
+
+    ppo_cfg.adv_guess_weight = adv_guess_weight
 
     for update in progress:
         if cfg.ent_decay_updates > 0:
@@ -433,12 +486,29 @@ def main() -> None:
         ppo_cfg.ent_coef = current_ent_coef
 
         t0 = time.time()
+        if aux_base_weight > 0.0 or aux_warmup_weight > 0.0 or aux_final_weight > 0.0:
+            if aux_warmup_updates > 0 and (update + 1) <= aux_warmup_updates:
+                current_aux_weight = aux_warmup_weight
+            else:
+                if cfg.total_updates > aux_warmup_updates:
+                    frac = (update + 1 - aux_warmup_updates) / max(1, cfg.total_updates - aux_warmup_updates)
+                else:
+                    frac = 1.0
+                frac = min(1.0, max(0.0, frac))
+                if aux_decay_power != 1.0:
+                    frac = frac ** aux_decay_power
+                current_aux_weight = aux_warmup_weight + (aux_final_weight - aux_warmup_weight) * frac
+        else:
+            current_aux_weight = 0.0
+        current_aux_weight = float(max(0.0, current_aux_weight))
+        ppo_cfg.aux_mine_weight = current_aux_weight
+
         buffer, aux = collect_rollout(
             vec,
             model,
             steps=cfg.steps_per_env,
             device=device,
-            aux_mine_weight=cfg.aux_mine_weight,
+            aux_mine_weight=current_aux_weight,
         )
         buffer.compute_gae(aux["last_values"], gamma=cfg.gamma, lam=cfg.gae_lambda)
 
@@ -450,7 +520,7 @@ def main() -> None:
         count = 0
         for _ in range(cfg.ppo_epochs):
             for batch in buffer.get_minibatches(minibatch_size):
-                stats = ppo_update(model, opt, batch, cfg=ppo_cfg)
+                stats = ppo_update(model, opt, batch, cfg=ppo_cfg, scaler=scaler)
                 loss_sum += stats["loss"]
                 policy_sum += stats["policy_loss"]
                 value_sum += stats["value_loss"]
@@ -489,6 +559,7 @@ def main() -> None:
             "entropy": float(ent_avg),
             "ent_coef": float(current_ent_coef),
             "aux_bce": float(aux_avg) if aux_count > 0 else None,
+            "aux_weight": float(current_aux_weight),
             "quick_win_rate": None,
             "quick_guesses_per_ep": None,
             "quick_guess_success": None,
@@ -633,6 +704,11 @@ def main() -> None:
             "best_update": best_update,
             "stopped_early": stopped_early,
             "early_stop_patience": early_stop_patience,
+            "aux_mine_warmup_weight": aux_warmup_weight if aux_warmup_updates > 0 else None,
+            "aux_mine_final_weight": aux_final_weight,
+            "aux_mine_warmup_updates": aux_warmup_updates if aux_warmup_updates > 0 else None,
+            "aux_mine_decay_power": aux_decay_power,
+            "adv_guess_weight": adv_guess_weight,
         }
         with open(os.path.join(args.out, "summary.json"), "w") as f:
             json.dump(summary, f)

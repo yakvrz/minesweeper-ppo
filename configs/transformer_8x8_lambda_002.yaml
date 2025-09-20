@@ -36,3 +36,4 @@ ppo:
 training:
   beta_l2: 0.0001
   early_stop_patience: 40
+  gradient_checkpointing: true
