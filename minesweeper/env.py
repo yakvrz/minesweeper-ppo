@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, Tuple, Optional
 
 import numpy as np
@@ -11,12 +12,22 @@ from .rules import forced_moves
 
 
 @dataclass
+class SolverPreset(str, Enum):
+    ZF = "zf"
+    ZF_CHORD = "zf_chord"
+    ZF_CHORD_ALL_SAFE = "zf_chord_all_safe"
+    ZF_CHORD_ALL_SAFE_ALL_MINE = "zf_chord_all_safe_all_mine"
+    ZF_CHORD_ALL_SAFE_ALL_MINE_PAIRWISE = "zf_chord_all_safe_all_mine_pairwise"
+
+
+@dataclass
 class EnvConfig:
     H: int = 8
     W: int = 8
     mine_count: int = 10
     guarantee_safe_neighborhood: bool = True
-    use_pair_constraints: bool = True
+    use_pair_constraints: bool | None = None  # deprecated
+    solver_preset: str = SolverPreset.ZF_CHORD_ALL_SAFE_ALL_MINE_PAIRWISE.value
 
     win_reward: float = 1.0
     loss_reward: float = -1.0

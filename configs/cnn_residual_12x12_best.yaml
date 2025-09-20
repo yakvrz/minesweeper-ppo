@@ -3,7 +3,7 @@ env:
   W: 12
   mine_count: 20
   guarantee_safe_neighborhood: true
-  use_pair_constraints: false
+  solver_preset: zf_chord_all_safe_all_mine
   include_flags_channel: false
   include_frontier_channel: true
   include_progress_channel: true

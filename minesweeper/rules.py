@@ -29,6 +29,17 @@ _NEIGHBOR_OFFSETS: Tuple[Tuple[int, int], ...] = tuple(
     if not (dr == 0 and dc == 0)
 )
 
+_SOLVER_PRESET_LEVELS = {
+    "zf": 1,
+    "zf_chord": 2,
+    "zf_chord_all_safe": 3,
+    "zf_chord_all_safe_all_mine": 4,
+    "zf_chord_all_safe_all_mine_pairwise": 5,
+    "pairwise": 5,
+    "full": 5,
+    "default": 5,
+}
+
 
 def _forced_moves_numpy(
     revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray
@@ -83,6 +94,64 @@ def _forced_moves_numpy(
     return moves
 
 
+def _solver_level_from_state(state) -> int:
+    cfg = getattr(state, "cfg", None)
+    if cfg is None:
+        return 5
+    preset = getattr(cfg, "solver_preset", None)
+    if preset is not None:
+        key = str(preset).strip().lower()
+        if key.isdigit():
+            try:
+                level = int(key)
+                return max(1, min(5, level))
+            except Exception:
+                pass
+        level = _SOLVER_PRESET_LEVELS.get(key)
+        if level is not None:
+            return level
+    use_pair = getattr(cfg, "use_pair_constraints", None)
+    if use_pair is not None:
+        return 5 if bool(use_pair) else 4
+    return 5
+
+
+def _has_flag_neighbor(flags: np.ndarray, idx: int, width: int) -> bool:
+    H, W = flags.shape
+    r, c = divmod(idx, width)
+    for dr, dc in _NEIGHBOR_OFFSETS:
+        rr = r + dr
+        cc = c + dc
+        if 0 <= rr < H and 0 <= cc < W and flags[rr, cc]:
+            return True
+    return False
+
+
+def _dedupe_moves(moves: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    best = {}
+    for action, idx in moves:
+        if idx not in best or action == "reveal":
+            best[idx] = action
+    return [(action, idx) for idx, action in best.items()]
+
+
+def _split_moves(state, moves: List[Tuple[str, int]]) -> tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]]:
+    safe_all: List[Tuple[str, int]] = []
+    safe_chord: List[Tuple[str, int]] = []
+    mine_moves: List[Tuple[str, int]] = []
+    flags = state.flags
+    width = state.W
+    for action, idx in moves:
+        idx_int = int(idx)
+        if action == "reveal":
+            safe_all.append((action, idx_int))
+            if _has_flag_neighbor(flags, idx_int, width):
+                safe_chord.append((action, idx_int))
+        elif action == "flag":
+            mine_moves.append((action, idx_int))
+    return safe_all, safe_chord, mine_moves
+
+
 def forced_moves(state) -> List[Tuple[str, int]]:
     """Compute forced moves from a Minesweeper state using classic constraints.
 
@@ -110,7 +179,9 @@ def forced_moves(state) -> List[Tuple[str, int]]:
             for act, idx in zip(actions, indices)
         ]
 
-    use_pair = getattr(getattr(state, "cfg", None), "use_pair_constraints", True)
+    level = _solver_level_from_state(state)
+    if level <= 1:
+        return []
 
     moves = _forced_moves_numpy(revealed, flags, counts)
     if not moves and _HAS_TORCH:
@@ -120,10 +191,21 @@ def forced_moves(state) -> List[Tuple[str, int]]:
     if not moves:
         moves = _forced_moves_py(revealed, flags, counts)
 
-    if use_pair and moves:
+    if level >= 5 and moves:
         moves = _apply_pair_constraints(revealed, flags, counts, moves)
+    if not moves:
+        return []
 
-    return moves
+    safe_all, safe_chord, mine_moves = _split_moves(state, moves)
+
+    if level == 2:
+        selected = safe_chord
+    elif level == 3:
+        selected = safe_all
+    else:  # level 4 or 5
+        selected = safe_all + mine_moves
+
+    return _dedupe_moves(selected)
 
 
 def _forced_moves_py(revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray) -> List[Tuple[str, int]]:
