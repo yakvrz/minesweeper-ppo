@@ -51,7 +51,6 @@ class _Attention(nn.Module):
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
@@ -71,12 +70,19 @@ class _Attention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn_mask = None
         if self.rel_pos_bias is not None and self.rel_pos_index is not None:
             bias = self.rel_pos_bias[:, self.rel_pos_index]  # [H,N,N]
-            attn = attn + bias.unsqueeze(0)
-        attn = torch.softmax(attn, dim=-1)
-        out = attn @ v  # [B,H,N,D]
+            attn_mask = bias.unsqueeze(0).to(dtype=q.dtype, device=q.device)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
         out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out)
 
