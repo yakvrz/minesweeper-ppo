@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List
 import argparse
@@ -15,7 +16,7 @@ import yaml
 
 from minesweeper.env import EnvConfig, MinesweeperEnv, VecMinesweeper
 from minesweeper.models import build_model
-from minesweeper.rules import forced_moves
+from minesweeper.rules import forced_moves, analyze_forced_modules
 
 
 def _assert_action_space(mask: torch.Tensor, logits: torch.Tensor, env: MinesweeperEnv) -> None:
@@ -37,6 +38,25 @@ class ControllerState:
 def _init_controller_state(reveal_count: int, device: torch.device | None = None) -> ControllerState:
     cooldown = torch.zeros(reveal_count, dtype=torch.int64, device=device or torch.device("cpu"))
     return ControllerState(cooldown=cooldown)
+
+
+def _forced_moves_full(env) -> list[tuple[str, int]]:
+    cfg = getattr(env, "cfg", None)
+    if cfg is None:
+        return forced_moves(env)
+    preset_prev = getattr(cfg, "solver_preset", None)
+    pair_prev = getattr(cfg, "use_pair_constraints", None)
+    cfg.solver_preset = "zf_chord_all_safe_all_mine_pairwise"
+    if pair_prev is not None:
+        cfg.use_pair_constraints = True
+    moves = forced_moves(env)
+    if preset_prev is not None:
+        cfg.solver_preset = preset_prev
+    else:
+        delattr(cfg, "solver_preset")
+    if pair_prev is not None:
+        cfg.use_pair_constraints = pair_prev
+    return moves
 
 
 def _controller_prepare_state(state: ControllerState, reveal_count: int) -> None:
@@ -289,6 +309,8 @@ def evaluate(
     forced_correct = 0
     true_guess_attempts = 0
     true_guess_success = 0
+    module_hits: Counter[str] = Counter()
+    module_occ: Counter[str] = Counter()
 
     for ep in range(episodes):
         env = MinesweeperEnv(env_cfg, seed=int(rng.integers(0, 2**31 - 1)))
@@ -312,6 +334,10 @@ def evaluate(
             forced = _forced_moves_full(env)
             forced_reveals = {mv for act, mv in forced if act == "reveal"}
             forced_flags = {mv for act, mv in forced if act == "flag"}
+            module_sets = analyze_forced_modules(env)
+            for mod, idx_set in module_sets.items():
+                if idx_set:
+                    module_occ[mod] += 1
 
             if use_controller:
                 mine_slice = mine_logits[0, 0] if mine_logits is not None else None
@@ -327,6 +353,16 @@ def evaluate(
             cell_idx = action if not is_flag else action - reveal_count
             r_cell, c_cell = divmod(cell_idx, env.W)
             forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
+            if not is_flag:
+                if cell_idx in module_sets.get("all_safe", set()):
+                    module_hits["all_safe"] += 1
+                if cell_idx in module_sets.get("pair_reveal", set()):
+                    module_hits["pair_reveal"] += 1
+            else:
+                if cell_idx in module_sets.get("all_mine", set()):
+                    module_hits["all_mine"] += 1
+                if cell_idx in module_sets.get("pair_flag", set()):
+                    module_hits["pair_flag"] += 1
             if forced_step:
                 forced_steps += 1
                 if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
@@ -370,6 +406,8 @@ def evaluate(
         "true_guess_success_rate": (true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
         "true_guess_attempts": true_guess_attempts,
     }
+    for mod, occ in module_occ.items():
+        result[f"{mod}_recall"] = (module_hits[mod] / occ) if occ else float("nan")
     return result
 
 
@@ -416,6 +454,8 @@ def evaluate_vec(
     forced_correct_steps = 0
     true_guess_attempts = 0
     true_guess_success = 0
+    module_hits_vec: Counter[str] = Counter()
+    module_occ_vec: Counter[str] = Counter()
 
     if print_fn is None:
         def print_fn(msg: str):
@@ -480,6 +520,10 @@ def evaluate_vec(
                     forced = _forced_moves_full(env)
                     forced_reveals = {mv for act, mv in forced if act == "reveal"}
                     forced_flags = {mv for act, mv in forced if act == "flag"}
+                    module_sets = analyze_forced_modules(env)
+                    for mod, idx_set in module_sets.items():
+                        if idx_set:
+                            module_occ_vec[mod] += 1
                     forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
 
                     if forced_step:
@@ -490,6 +534,16 @@ def evaluate_vec(
                         true_guess_attempts += 1
                         if (not is_flag and not env.mine_mask[row, col]) or (is_flag and env.mine_mask[row, col]):
                             true_guess_success += 1
+                    if not is_flag:
+                        if cell_idx in module_sets.get("all_safe", set()):
+                            module_hits_vec["all_safe"] += 1
+                        if cell_idx in module_sets.get("pair_reveal", set()):
+                            module_hits_vec["pair_reveal"] += 1
+                    else:
+                        if cell_idx in module_sets.get("all_mine", set()):
+                            module_hits_vec["all_mine"] += 1
+                        if cell_idx in module_sets.get("pair_flag", set()):
+                            module_hits_vec["pair_flag"] += 1
 
                 batch, rewards_np, dones_np, infos = vec.step(actions)
                 rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
@@ -558,7 +612,7 @@ def evaluate_vec(
     total_guess_attempts = true_guess_attempts
     total_guess_success = true_guess_success
 
-    return {
+    result = {
         "win_rate": wins / max(1, episodes),
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
@@ -578,6 +632,9 @@ def evaluate_vec(
         "total_guess_attempts": int(total_guess_attempts),
         "total_guess_success": int(total_guess_success),
     }
+    for mod, occ in module_occ_vec.items():
+        result[f"{mod}_recall"] = (module_hits_vec[mod] / occ) if occ else float("nan")
+    return result
 
 
 
@@ -692,20 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-def _forced_moves_full(env) -> list[tuple[str, int]]:
-    cfg = getattr(env, "cfg", None)
-    if cfg is None:
-        return forced_moves(env)
-    preset_prev = getattr(cfg, "solver_preset", None)
-    pair_prev = getattr(cfg, "use_pair_constraints", None)
-    cfg.solver_preset = "zf_chord_all_safe_all_mine_pairwise"
-    if pair_prev is not None:
-        cfg.use_pair_constraints = True
-    moves = forced_moves(env)
-    if preset_prev is not None:
-        cfg.solver_preset = preset_prev
-    else:
-        delattr(cfg, "solver_preset")
-    if pair_prev is not None:
-        cfg.use_pair_constraints = pair_prev
-    return moves

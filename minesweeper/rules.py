@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Set, Tuple
 import numpy as np
 
 try:  # Optional acceleration if numba is installed.
@@ -208,6 +208,57 @@ def forced_moves(state) -> List[Tuple[str, int]]:
         selected = safe_all + mine_moves
 
     return _dedupe_moves(selected)
+
+
+def analyze_forced_modules(state) -> Dict[str, Set[int]]:
+    """Return per-rule forced move sets for analysis (no side effects)."""
+
+    revealed: np.ndarray = state.revealed
+    flags: np.ndarray = state.flags
+    counts: np.ndarray = state.adjacent_counts
+    H, W = revealed.shape
+    unknown = (~revealed) & (~flags)
+
+    all_safe_reveal: Set[int] = set()
+    all_mine_flag: Set[int] = set()
+
+    number_cells = np.transpose(np.nonzero(revealed & (counts > 0)))
+    for r, c in number_cells:
+        neigh = list(_neighbors(H, W, int(r), int(c)))
+        flagged = sum(1 for (rr, cc) in neigh if flags[rr, cc])
+        unknown_cells = [(rr, cc) for (rr, cc) in neigh if unknown[rr, cc]]
+        if not unknown_cells:
+            continue
+        count_val = int(counts[r, c])
+        if flagged == count_val:
+            for rr, cc in unknown_cells:
+                all_safe_reveal.add(int(rr * W + cc))
+        if flagged + len(unknown_cells) == count_val:
+            for rr, cc in unknown_cells:
+                all_mine_flag.add(int(rr * W + cc))
+
+    base_moves = [("reveal", idx) for idx in all_safe_reveal] + [("flag", idx) for idx in all_mine_flag]
+    pair_reveal: Set[int] = set()
+    pair_flag: Set[int] = set()
+    try:
+        pair_moves = _apply_pair_constraints(revealed, flags, counts, base_moves)
+    except Exception:
+        pair_moves = []
+    for act, idx in pair_moves:
+        idx_int = int(idx)
+        if act == "reveal":
+            if idx_int not in all_safe_reveal:
+                pair_reveal.add(idx_int)
+        elif act == "flag":
+            if idx_int not in all_mine_flag:
+                pair_flag.add(idx_int)
+
+    return {
+        "all_safe": all_safe_reveal,
+        "all_mine": all_mine_flag,
+        "pair_reveal": pair_reveal,
+        "pair_flag": pair_flag,
+    }
 
 
 def _forced_moves_py(revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray) -> List[Tuple[str, int]]:
