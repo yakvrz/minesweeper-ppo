@@ -164,26 +164,28 @@ def forced_moves(state) -> List[Tuple[str, int]]:
     flattened board of size H*W. NumPy/Numba is used for speed when available.
     """
 
+    level = _solver_level_from_state(state)
+    if level <= 1:
+        return []
+
     revealed: np.ndarray = state.revealed
     flags: np.ndarray = state.flags
     counts: np.ndarray = state.adjacent_counts
 
+    moves: List[Tuple[str, int]] = []
     if _HAS_NUMBA:
         actions, indices = _forced_moves_numba(
             np.ascontiguousarray(revealed, dtype=np.bool_),
             np.ascontiguousarray(flags, dtype=np.bool_),
             np.ascontiguousarray(counts, dtype=np.uint8),
         )
-        return [
+        moves = [
             ("reveal" if act == 2 else "flag", int(idx))
             for act, idx in zip(actions, indices)
         ]
 
-    level = _solver_level_from_state(state)
-    if level <= 1:
-        return []
-
-    moves = _forced_moves_numpy(revealed, flags, counts)
+    if not moves:
+        moves = _forced_moves_numpy(revealed, flags, counts)
     if not moves and _HAS_TORCH:
         actions, indices = _forced_moves_torch(revealed, flags, counts)
         moves = [("reveal" if act == 2 else "flag", int(idx)) for act, idx in zip(actions, indices)]
