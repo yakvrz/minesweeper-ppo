@@ -278,7 +278,6 @@ def evaluate(
     reveal_only: bool = False,
     use_controller: bool = False,
     controller_cooldown: int = 2,
-    enable_guess_metrics: bool = False,
 ) -> Dict[str, float]:
     device = next(model.parameters()).device
     rng = np.random.default_rng(seed)
@@ -286,10 +285,6 @@ def evaluate(
     total_steps = 0
     total_progress = 0.0
     invalids = 0
-    forced_steps = 0
-    forced_correct = 0
-    true_guess_attempts = 0
-    true_guess_success = 0
     forced_steps = 0
     forced_correct = 0
     true_guess_attempts = 0
@@ -314,10 +309,9 @@ def evaluate(
                 mine_logits = None
             _assert_action_space(mask, logits, env)
 
-            if enable_guess_metrics:
-                forced = _forced_moves_full(env)
-                forced_reveals = {mv for act, mv in forced if act == "reveal"}
-                forced_flags = {mv for act, mv in forced if act == "flag"}
+            forced = _forced_moves_full(env)
+            forced_reveals = {mv for act, mv in forced if act == "reveal"}
+            forced_flags = {mv for act, mv in forced if act == "flag"}
 
             if use_controller:
                 mine_slice = mine_logits[0, 0] if mine_logits is not None else None
@@ -333,15 +327,14 @@ def evaluate(
             cell_idx = action if not is_flag else action - reveal_count
             r_cell, c_cell = divmod(cell_idx, env.W)
             forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
-            if enable_guess_metrics:
-                if forced_step:
-                    forced_steps += 1
-                    if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
-                        forced_correct += 1
-                else:
-                    true_guess_attempts += 1
-                    if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
-                        true_guess_success += 1
+            if forced_step:
+                forced_steps += 1
+                if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
+                    forced_correct += 1
+            else:
+                true_guess_attempts += 1
+                if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
+                    true_guess_success += 1
 
             prev_flags = env.flags.copy()
             d, r, done, info = env.step(action)
@@ -372,14 +365,11 @@ def evaluate(
         "avg_steps": total_steps / episodes,
         "avg_progress": total_progress / episodes,
         "invalid_rate": invalids / max(1, total_steps),
+        "forced_move_recall": (forced_correct / forced_steps) if forced_steps else float("nan"),
+        "forced_move_steps": forced_steps,
+        "true_guess_success_rate": (true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
+        "true_guess_attempts": true_guess_attempts,
     }
-    if enable_guess_metrics:
-        result.update(
-            forced_move_recall=(forced_correct / forced_steps) if forced_steps else float("nan"),
-            forced_move_steps=forced_steps,
-            true_guess_success_rate=(true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
-            true_guess_attempts=true_guess_attempts,
-        )
     return result
 
 
