@@ -128,7 +128,7 @@ class TransformerPolicy(nn.Module):
         self.N = self.H * self.W
         self.include_flags_channel = include_flags_channel
         self.include_frontier_channel = include_frontier_channel
-        self.include_remaining_mines_channel = include_remaining_mines_channel
+        # remaining mines channel removed
         self.include_progress_channel = include_progress_channel
         self.tie_reveal_to_belief = bool(tie_reveal_to_belief)
         self.num_global_tokens = max(0, int(num_global_tokens))
@@ -140,8 +140,7 @@ class TransformerPolicy(nn.Module):
             token_dim += 1
         if include_frontier_channel:
             token_dim += 1
-        if include_remaining_mines_channel:
-            token_dim += 1
+        # remaining mines channel removed
         if include_progress_channel:
             token_dim += 1
 
@@ -243,10 +242,7 @@ class TransformerPolicy(nn.Module):
             frontier = obs[:, offset : offset + 1]
             features.append(frontier)
             offset += 1
-        if self.include_remaining_mines_channel:
-            remaining = obs[:, offset : offset + 1]
-            features.append(remaining)
-            offset += 1
+        # remaining mines channel removed
         if self.include_progress_channel:
             progress = obs[:, offset : offset + 1]
             features.append(progress)

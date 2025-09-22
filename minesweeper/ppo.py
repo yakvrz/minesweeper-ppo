@@ -18,7 +18,6 @@ class PPOConfig:
     aux_mine_calib_weight: float = 0.0
     max_grad_norm: float = 0.5
     beta_l2: float = 0.0
-    adv_guess_weight: float = 0.0
 
 
 def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.cuda.amp.GradScaler] = None) -> Dict[str, float]:
@@ -91,18 +90,8 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
             beta_pen = model.beta_regularizer()
             loss = loss + cfg.beta_l2 * beta_pen
 
+        # Removed adversarial penalty on choosing high mine-prob cells
         adv_penalty_mean = None
-        if cfg.adv_guess_weight > 0 and mine_logits is not None:
-            mine_logits_flat = mine_logits.view(mine_logits.shape[0], -1)
-            gather_idx = torch.arange(mine_logits_flat.shape[0], device=mine_logits_flat.device)
-            chosen_logits = mine_logits_flat[gather_idx, batch.actions]
-            if hasattr(batch, "mine_valid") and batch.mine_valid is not None:
-                mine_valid_flat = batch.mine_valid.view(batch.mine_valid.shape[0], -1)
-                chosen_valid = mine_valid_flat[gather_idx, batch.actions].float()
-            else:
-                chosen_valid = torch.ones_like(chosen_logits)
-            adv_penalty_mean = (torch.sigmoid(chosen_logits) * chosen_valid).mean()
-            loss = loss + cfg.adv_guess_weight * adv_penalty_mean
 
     optimizer.zero_grad(set_to_none=True)
     if scaler is not None and batch.obs.is_cuda:
@@ -126,8 +115,5 @@ def ppo_update(model, optimizer, batch, cfg: PPOConfig, scaler: Optional[torch.c
         stats["aux_bce"] = float(aux_bce.item())
     if calib_loss is not None:
         stats["aux_calib"] = float(calib_loss.item())
-    if cfg.adv_guess_weight > 0:
-        stats["adv_weight"] = float(cfg.adv_guess_weight)
-    if adv_penalty_mean is not None:
-        stats["adv_penalty"] = float(adv_penalty_mean.item())
+    # no adversarial penalty stats
     return stats

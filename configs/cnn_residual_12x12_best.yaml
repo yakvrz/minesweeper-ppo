@@ -3,11 +3,11 @@ env:
   W: 12
   mine_count: 20
   guarantee_safe_neighborhood: true
-  solver_preset: zf_chord_all_safe_all_mine
+  solver_preset: zf_chord
   include_flags_channel: false
   include_frontier_channel: true
   include_progress_channel: true
-  include_remaining_mines_channel: true
+  # removed
   progress_scale: 0.6
   step_penalty: 0.0001
 

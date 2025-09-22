@@ -32,7 +32,7 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 - Optional observation channels:
   - `include_flags_channel`
   - `include_frontier_channel`
-  - `include_remaining_mines_channel`
+  - (removed) remaining mines channel
   - `include_progress_channel`
 
 ## Metrics to monitor

@@ -73,25 +73,10 @@ torch.set_float32_matmul_precision("high")
 
 
 def _configure_flash_attention(mode: str, log: logging.Logger) -> None:
-    if mode == "auto":
-        if torch.cuda.is_available() and _cuda_sdp_kernel is not None:
-            _cuda_sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
-        return
-    if _cuda_sdp_kernel is None:
-        if mode != "auto":
-            log.warning("Flash attention toggle requested but torch does not expose sdp_kernel controls; ignoring")
-        return
-    if not torch.cuda.is_available():
-        log.warning("Flash attention toggle requested but CUDA is unavailable; ignoring")
-        return
-    if mode == "on":
-        _cuda_sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
-        log.info("Flash attention kernels enabled")
-    elif mode == "off":
-        _cuda_sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=True)
-        log.info("Flash attention kernels disabled")
-    else:
-        log.warning("Unknown flash attention mode '%s'; leaving defaults", mode)
+    # Use PyTorch defaults; avoid deprecated sdp_kernel toggles to silence warnings.
+    if mode != "auto":
+        log.info("Ignoring flash_attention toggle (using PyTorch defaults)")
+    return
 
 
 @dataclass
@@ -319,6 +304,7 @@ def main() -> None:
     parser.add_argument("--quick_eval_pairs", type=int, default=2, help="Quick eval repetitions (averaged)")
     parser.add_argument("--quick_eval_interval", type=int, default=10, help="Run quick evaluation every N updates (0 disables)")
     parser.add_argument("--eval_pairs", type=int, default=1, help="Repeat final evaluation batches (averaged)")
+    parser.add_argument("--skip_final_eval", action="store_true", help="Skip the post-training evaluation run")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing for transformer blocks")
     parser.add_argument(
         "--flash_attention",
@@ -382,7 +368,6 @@ def main() -> None:
     env_flag_overrides = {
         "include_flags_channel": env_cfg.include_flags_channel,
         "include_frontier_channel": env_cfg.include_frontier_channel,
-        "include_remaining_mines_channel": env_cfg.include_remaining_mines_channel,
         "include_progress_channel": env_cfg.include_progress_channel,
     }
     model = build_model(
@@ -432,7 +417,10 @@ def main() -> None:
                 log.info(f"Loaded init checkpoint from {args.init_ckpt}")
 
     opt = AdamW(model.parameters(), lr=cfg.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     sched = CosineAnnealingLR(opt, T_max=cfg.total_updates)
     ppo_cfg = PPOConfig(
         clip_eps=cfg.clip_eps,
@@ -443,7 +431,6 @@ def main() -> None:
         aux_mine_calib_weight=cfg.aux_mine_calib_weight,
         max_grad_norm=cfg.max_grad_norm,
         beta_l2=beta_l2,
-        adv_guess_weight=0.0,
     )
 
     progress = tqdm(range(cfg.total_updates), desc="updates", disable=not sys.stdout.isatty())
@@ -644,9 +631,9 @@ def main() -> None:
             }
             torch.save(payload_latest, ckpt_latest)
 
-        quick_episodes = min(args.eval_quick_episodes, args.eval_episodes)
-        interval = args.quick_eval_interval if args.quick_eval_interval and args.quick_eval_interval > 0 else None
-        should_quick_eval = quick_episodes > 0 and (interval is None or (update + 1) % interval == 0)
+        quick_episodes = max(0, min(args.eval_quick_episodes, args.eval_episodes))
+        quick_interval = args.quick_eval_interval if args.quick_eval_interval is not None else 0
+        should_quick_eval = quick_episodes > 0 and quick_interval > 0 and (update + 1) % quick_interval == 0
         if should_quick_eval:
             try:
                 metrics_quick = _evaluate_model(
@@ -660,22 +647,16 @@ def main() -> None:
                 win_quick = float(metrics_quick.get("win_rate", 0.0))
                 row = per_update_rows[-1]
                 row["quick_win_rate"] = win_quick
-                row["quick_guesses_per_ep"] = metrics_quick.get("guesses_per_episode")
-                row["quick_guess_success"] = metrics_quick.get("guess_success_rate")
                 row["quick_belief_auroc"] = metrics_quick.get("belief_auroc")
                 row["quick_belief_ece"] = metrics_quick.get("belief_ece")
                 score = _quick_eval_score(metrics_quick)
                 row["quick_score"] = score
-                guesses_ep = row["quick_guesses_per_ep"]
-                guess_success = row["quick_guess_success"]
                 auroc = row["quick_belief_auroc"]
                 log.info(
-                    "quick eval upd %d: win_rate=%.3f avg_steps=%.2f guesses/ep=%.2f guess_success=%.2f auroc=%.3f score=%.3f",
+                    "quick eval upd %d: win_rate=%.3f avg_steps=%.2f auroc=%.3f score=%.3f",
                     update + 1,
                     win_quick,
                     metrics_quick.get("avg_steps", float('nan')),
-                    float(guesses_ep) if guesses_ep is not None else float('nan'),
-                    float(guess_success) if guess_success is not None else float('nan'),
                     float(auroc) if auroc is not None else float('nan'),
                     score,
                 )
@@ -712,10 +693,16 @@ def main() -> None:
     # Export per-update CSV
     try:
         csv_path = os.path.join(args.out, "train_metrics.csv")
+        # Build unified header across all rows to avoid missing column warnings
+        all_keys = set()
+        for row in per_update_rows:
+            all_keys.update(row.keys())
+        fieldnames = sorted(all_keys)
         with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(per_update_rows[0].keys()))
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(per_update_rows)
+            for row in per_update_rows:
+                writer.writerow(row)
         log.info("Wrote %s", csv_path)
     except Exception as exc:  # pragma: no cover - logging only
         log.warning("Failed writing train_metrics.csv: %s", exc)
@@ -746,17 +733,25 @@ def main() -> None:
             last_ckpt = ckpt_final
 
     # End-of-training evaluation
+    metrics_raw = None
+    if not args.skip_final_eval and args.eval_episodes > 0 and args.eval_num_envs > 0:
+        try:
+            eval_eps = int(max(1, args.eval_episodes))
+            eval_envs = int(min(args.eval_num_envs, max(1, eval_eps)))
+            metrics_raw = _evaluate_model(
+                model,
+                env_cfg,
+                episodes=eval_eps,
+                seed=args.seed * 17,
+                num_envs=eval_envs,
+                pairs=args.eval_pairs,
+            )
+        except Exception as exc:  # pragma: no cover - logging only
+            log.warning("Final eval failed: %s", exc)
+    else:
+        log.info("Skipping final evaluation")
+
     try:
-        eval_eps = int(max(8, args.eval_episodes))
-        eval_envs = int(min(args.eval_num_envs, eval_eps))
-        metrics_raw = _evaluate_model(
-            model,
-            env_cfg,
-            episodes=eval_eps,
-            seed=args.seed * 17,
-            num_envs=eval_envs,
-            pairs=args.eval_pairs,
-        )
         summary = {
             "checkpoint": os.path.basename(last_ckpt) if last_ckpt else None,
             "metrics_raw": metrics_raw,
@@ -781,7 +776,7 @@ def main() -> None:
             json.dump(summary, f)
         log.info("Wrote summary.json: %s", summary)
     except Exception as exc:  # pragma: no cover - logging only
-        log.warning("Final eval failed: %s", exc)
+        log.warning("Failed writing summary.json: %s", exc)
 
 
 if __name__ == "__main__":

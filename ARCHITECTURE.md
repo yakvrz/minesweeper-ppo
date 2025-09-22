@@ -291,7 +291,7 @@ env:
   step_penalty: 0.0001
   progress_scale: 0.6
   include_frontier_channel: true
-  include_remaining_mines_channel: true
+  # remaining mines channel removed
   include_progress_channel: true
 
 model:

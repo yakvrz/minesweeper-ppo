@@ -56,12 +56,10 @@ def build_model(
         H, W = obs_shape[1], obs_shape[2]
         include_flags_channel = bool(env_overrides.get("include_flags_channel", False))
         include_frontier_channel = bool(env_overrides.get("include_frontier_channel", False))
-        include_remaining_mines_channel = bool(env_overrides.get("include_remaining_mines_channel", False))
         include_progress_channel = bool(env_overrides.get("include_progress_channel", False))
         transformer_cfg = {
             "include_flags_channel": include_flags_channel,
             "include_frontier_channel": include_frontier_channel,
-            "include_remaining_mines_channel": include_remaining_mines_channel,
             "include_progress_channel": include_progress_channel,
         }
         transformer_cfg.update(cfg)

@@ -31,13 +31,6 @@ _NEIGHBOR_OFFSETS: Tuple[Tuple[int, int], ...] = tuple(
 
 _SOLVER_PRESET_LEVELS = {
     "zf": 1,
-    "zf_chord": 2,
-    "zf_chord_all_safe": 3,
-    "zf_chord_all_safe_all_mine": 4,
-    "zf_chord_all_safe_all_mine_pairwise": 5,
-    "pairwise": 5,
-    "full": 5,
-    "default": 5,
 }
 
 
@@ -112,8 +105,8 @@ def _solver_level_from_state(state) -> int:
             return level
     use_pair = getattr(cfg, "use_pair_constraints", None)
     if use_pair is not None:
-        return 5 if bool(use_pair) else 4
-    return 5
+        return 1
+    return 1
 
 
 def _has_flag_neighbor(flags: np.ndarray, idx: int, width: int) -> bool:
@@ -211,16 +204,21 @@ def forced_moves(state) -> List[Tuple[str, int]]:
 
 
 def analyze_forced_modules(state) -> Dict[str, Set[int]]:
-    """Return per-rule forced move sets for analysis (no side effects)."""
+    """Return per-rule forced move sets for analysis (no side effects).
+
+    We expose only the pairwise subset/superset reveal rule (renamed to
+    "subset_reveal"): if two number cells' unknown-neighbor sets are in an
+    inclusion relationship and imply the same mine count, cells in the set
+    difference are guaranteed safe.
+    """
 
     revealed: np.ndarray = state.revealed
     counts: np.ndarray = state.adjacent_counts
     mines: np.ndarray = state.mine_mask
     H, W = revealed.shape
-    unknown = ~revealed
+    unknown = (~revealed)
 
-    all_safe_reveal: Set[int] = set()
-    pair_reveal: Set[int] = set()
+    subset_reveal: Set[int] = set()
 
     number_cells = np.transpose(np.nonzero(revealed & (counts > 0)))
     unknown_sets: Dict[Tuple[int, int], Set[int]] = {}
@@ -235,11 +233,6 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
         mine_count = sum(1 for (rr, cc) in unknown_cells if mines[rr, cc])
         unknown_sets[(r, c)] = idxs
         mine_counts[(r, c)] = mine_count
-        if mine_count == 0:
-            all_safe_reveal.update(idxs)
-        if mine_count == len(unknown_cells):
-            # this is a forced flag scenario; skip because agent does not flag
-            pass
 
     keys = list(unknown_sets.keys())
     for i in range(len(keys)):
@@ -256,25 +249,14 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
             mines2 = mine_counts[(r2, c2)]
             if set1.issubset(set2):
                 diff = set2 - set1
-                if diff:
-                    if mines1 == mines2:
-                        pair_reveal.update(diff)
-                    if mines2 - mines1 == len(diff):
-                        # would imply forced flags; ignore for reveal-only policy
-                        pass
+                if diff and mines1 == mines2:
+                    subset_reveal.update(diff)
             if set2.issubset(set1):
                 diff = set1 - set2
-                if diff:
-                    if mines2 == mines1:
-                        pair_reveal.update(diff)
-                    if mines1 - mines2 == len(diff):
-                        # forced flags ignored
-                        pass
+                if diff and mines2 == mines1:
+                    subset_reveal.update(diff)
 
-    return {
-        "all_safe": all_safe_reveal,
-        "pair_reveal": pair_reveal,
-    }
+    return {"subset_reveal": subset_reveal}
 
 
 def _forced_moves_py(revealed: np.ndarray, flags: np.ndarray, counts: np.ndarray) -> List[Tuple[str, int]]:

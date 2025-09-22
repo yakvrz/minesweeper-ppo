@@ -24,7 +24,6 @@ def _assert_action_space(mask: torch.Tensor, logits: torch.Tensor, env: Mineswee
     reveal_count = env.H * env.W
     assert logits.shape[-1] == action_space, "policy logits/action dim mismatch"
     assert mask.shape[-1] == action_space, "mask/action dim mismatch"
-    assert bool(mask[..., :reveal_count].any().item()), "no valid reveals available"
     assert bool(mask.any().item()), "no valid actions available"
 
 
@@ -46,7 +45,7 @@ def _forced_moves_full(env) -> list[tuple[str, int]]:
         return forced_moves(env)
     preset_prev = getattr(cfg, "solver_preset", None)
     pair_prev = getattr(cfg, "use_pair_constraints", None)
-    cfg.solver_preset = "zf_chord_all_safe_all_mine_pairwise"
+    cfg.solver_preset = "5"
     if pair_prev is not None:
         cfg.use_pair_constraints = True
     moves = forced_moves(env)
@@ -305,12 +304,6 @@ def evaluate(
     total_steps = 0
     total_progress = 0.0
     invalids = 0
-    forced_steps = 0
-    forced_correct = 0
-    true_guess_attempts = 0
-    true_guess_success = 0
-    module_hits: Counter[str] = Counter()
-    module_occ: Counter[str] = Counter()
 
     for ep in range(episodes):
         env = MinesweeperEnv(env_cfg, seed=int(rng.integers(0, 2**31 - 1)))
@@ -331,14 +324,6 @@ def evaluate(
                 mine_logits = None
             _assert_action_space(mask, logits, env)
 
-            forced = _forced_moves_full(env)
-            forced_reveals = {mv for act, mv in forced if act == "reveal"}
-            forced_flags = {mv for act, mv in forced if act == "flag"}
-            module_sets = analyze_forced_modules(env)
-            for mod, idx_set in module_sets.items():
-                if idx_set:
-                    module_occ[mod] += 1
-
             if use_controller:
                 mine_slice = mine_logits[0, 0] if mine_logits is not None else None
                 action = _controller_select_action(
@@ -349,22 +334,8 @@ def evaluate(
                 action = int(masked_logits.argmax(dim=-1).item())
             assert bool(mask.view(-1)[action].item()), "selected action masked out"
 
-            is_flag = action >= reveal_count
-            cell_idx = action if not is_flag else action - reveal_count
+            cell_idx = action
             r_cell, c_cell = divmod(cell_idx, env.W)
-            forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
-            if cell_idx in module_sets.get("all_safe", set()):
-                module_hits["all_safe"] += 1
-            if cell_idx in module_sets.get("pair_reveal", set()):
-                module_hits["pair_reveal"] += 1
-            if forced_step:
-                forced_steps += 1
-                if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
-                    forced_correct += 1
-            else:
-                true_guess_attempts += 1
-                if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
-                    true_guess_success += 1
 
             prev_flags = env.flags.copy()
             d, r, done, info = env.step(action)
@@ -395,14 +366,7 @@ def evaluate(
         "avg_steps": total_steps / episodes,
         "avg_progress": total_progress / episodes,
         "invalid_rate": invalids / max(1, total_steps),
-        "forced_move_steps": forced_steps,
-        "true_guess_success_rate": (true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
-        "true_guess_attempts": true_guess_attempts,
     }
-    for mod, occ in module_occ.items():
-        result[f"{mod}_recall"] = (module_hits[mod] / occ) if occ else float("nan")
-    for mod in ["all_safe", "pair_reveal"]:
-        result.setdefault(f"{mod}_recall", float("nan"))
     return result
 
 
@@ -503,8 +467,7 @@ def evaluate_vec(
                     if counted[idx] or idx >= batch_size:
                         continue
                     action = int(actions[idx])
-                    is_flag = action >= reveal_count
-                    cell_idx = action if not is_flag else action - reveal_count
+                    cell_idx = action
                     row, col = divmod(cell_idx, env.W)
                     if mine_prob is not None:
                         unknown_mask = (~env.revealed) & (~env.flags)
@@ -512,27 +475,24 @@ def evaluate_vec(
                             belief_probs.append(mine_prob[idx, 0][unknown_mask].reshape(-1))
                             belief_labels.append(env.mine_mask[unknown_mask].astype(np.float32).reshape(-1))
 
-                    forced = _forced_moves_full(env)
-                    forced_reveals = {mv for act, mv in forced if act == "reveal"}
-                    forced_flags = {mv for act, mv in forced if act == "flag"}
+                    # Forced reveals defined solely by subset/superset rule
                     module_sets = analyze_forced_modules(env)
+                    forced_reveals = set(module_sets.get("subset_reveal", set()))
                     for mod, idx_set in module_sets.items():
                         if idx_set:
                             module_occ_vec[mod] += 1
-                    forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
+                    forced_step = (cell_idx in forced_reveals)
 
                     if forced_step:
                         forced_steps += 1
-                        if (not is_flag and not env.mine_mask[row, col]) or (is_flag and env.mine_mask[row, col]):
+                        if not env.mine_mask[row, col]:
                             forced_correct_steps += 1
                     else:
                         true_guess_attempts += 1
-                        if (not is_flag and not env.mine_mask[row, col]) or (is_flag and env.mine_mask[row, col]):
+                        if not env.mine_mask[row, col]:
                             true_guess_success += 1
-                    if cell_idx in module_sets.get("all_safe", set()):
-                        module_hits_vec["all_safe"] += 1
-                    if cell_idx in module_sets.get("pair_reveal", set()):
-                        module_hits_vec["pair_reveal"] += 1
+                    if cell_idx in module_sets.get("subset_reveal", set()):
+                        module_hits_vec["subset_reveal"] += 1
 
                 batch, rewards_np, dones_np, infos = vec.step(actions)
                 rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
@@ -603,21 +563,9 @@ def evaluate_vec(
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
-        "guesses_per_episode": true_guess_attempts / max(1, episodes),
-        "guess_success_rate": true_guess_success / max(1, true_guess_attempts) if true_guess_attempts else 0.0,
-        "forced_move_steps": forced_steps,
-        "forced_move_correct_steps": forced_correct_steps,
         "belief_auroc": belief_auroc,
         "belief_ece": belief_ece,
-        "episodes": int(episodes),
-        "wins": int(wins),
-        "guess_attempts": int(true_guess_attempts),
-        "guess_successes": int(true_guess_success),
     }
-    for mod, occ in module_occ_vec.items():
-        result[f"{mod}_recall"] = (module_hits_vec[mod] / occ) if occ else float("nan")
-    for mod in ["all_safe", "pair_reveal"]:
-        result.setdefault(f"{mod}_recall", float("nan"))
     return result
 
 
@@ -684,7 +632,6 @@ def main():
     env_flag_defaults = {
         "include_flags_channel": env_cfg.include_flags_channel,
         "include_frontier_channel": env_cfg.include_frontier_channel,
-        "include_remaining_mines_channel": env_cfg.include_remaining_mines_channel,
         "include_progress_channel": env_cfg.include_progress_channel,
     }
     env_flag_overrides = dict(env_flag_defaults)
@@ -701,7 +648,15 @@ def main():
     state_dict = dict(state["model"]) if isinstance(state, dict) and "model" in state else state
     if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
         state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+    # Filter out incompatible shapes (e.g., when head dimensions changed)
+    model_state = model.state_dict()
+    compat = {}
+    for k, v in state_dict.items():
+        if k in model_state and model_state[k].shape == v.shape:
+            compat[k] = v
+    missing = [k for k in model_state.keys() if k not in compat]
+    unexpected = [k for k in state_dict.keys() if k not in compat]
+    model.load_state_dict(compat, strict=False)
     model.eval()
 
     if args.debug_eval:
@@ -743,22 +698,6 @@ def main():
                 ["win_rate", "avg_steps", "avg_progress", "invalid_rate"],
             ),
             (
-                "Guess Metrics",
-                [
-                    "guesses_per_episode",
-                    "guess_success_rate",
-                    "guess_attempts",
-                    "guess_successes",
-                ],
-            ),
-            (
-                "Forced Move Recall",
-                [
-                    "all_safe_recall",
-                    "pair_reveal_recall",
-                ],
-            ),
-            (
                 "Belief Quality",
                 ["belief_auroc", "belief_ece"],
             ),
@@ -776,11 +715,7 @@ def main():
                 seen_keys.add(key)
                 print(f"  {key:20s}: {_fmt(value)}")
 
-        other_keys = sorted(k for k in summary.keys() if k not in seen_keys)
-        if other_keys:
-            print("\nOther metrics:")
-            for key in other_keys:
-                print(f"  {key:20s}: {_fmt(summary[key])}")
+        # Do not print an "Other metrics" section to avoid confusion
     else:
         print(json.dumps(summary), flush=True)
 

@@ -14,10 +14,6 @@ from .rules import forced_moves
 @dataclass
 class SolverPreset(str, Enum):
     ZF = "zf"
-    ZF_CHORD = "zf_chord"
-    ZF_CHORD_ALL_SAFE = "zf_chord_all_safe"
-    ZF_CHORD_ALL_SAFE_ALL_MINE = "zf_chord_all_safe_all_mine"
-    ZF_CHORD_ALL_SAFE_ALL_MINE_PAIRWISE = "zf_chord_all_safe_all_mine_pairwise"
 
 
 @dataclass
@@ -27,7 +23,7 @@ class EnvConfig:
     mine_count: int = 10
     guarantee_safe_neighborhood: bool = True
     use_pair_constraints: bool | None = None  # deprecated
-    solver_preset: str = SolverPreset.ZF_CHORD_ALL_SAFE_ALL_MINE_PAIRWISE.value
+    solver_preset: str = SolverPreset.ZF.value
 
     win_reward: float = 1.0
     loss_reward: float = -1.0
@@ -36,7 +32,7 @@ class EnvConfig:
 
     include_flags_channel: bool = False
     include_frontier_channel: bool = False
-    include_remaining_mines_channel: bool = False
+    # removed remaining mines ratio channel
     include_progress_channel: bool = False
 
 
@@ -54,7 +50,9 @@ class MinesweeperEnv:
         self.cfg = cfg
         self.H = int(cfg.H)
         self.W = int(cfg.W)
-        self.A = self.H * self.W
+        self.cell_count = self.H * self.W
+        self.reveal_count = self.cell_count
+        self.A = self.cell_count
 
         self.rng = np.random.default_rng(seed)
 
@@ -95,8 +93,7 @@ class MinesweeperEnv:
         channels += 9  # counts 0..8
         if self.cfg.include_frontier_channel:
             channels += 1
-        if self.cfg.include_remaining_mines_channel:
-            channels += 1
+        # remaining mines channel removed
         if self.cfg.include_progress_channel:
             channels += 1
         return channels
@@ -119,8 +116,10 @@ class MinesweeperEnv:
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, Dict]:
         action = int(action)
-        cell = action % (self.H * self.W)
+        reveal_count = self.reveal_count
+        cell = action % reveal_count
         r, c = divmod(cell, self.W)
+        # reveal-only action space
 
         reward = 0.0
         done = False
@@ -128,7 +127,7 @@ class MinesweeperEnv:
         outcome: Optional[str] = None
         self._last_new_reveals = 0
 
-        total_cells = self.H * self.W
+        total_cells = self.cell_count
         total_safe = total_cells - int(self.cfg.mine_count)
 
         if not self.revealed[r, c]:
@@ -143,20 +142,16 @@ class MinesweeperEnv:
                 reward += float(self.cfg.loss_reward)
             else:
                 newly_revealed = self._reveal_with_flood_fill(r, c)
+                self._last_new_reveals = newly_revealed
                 if newly_revealed > 0:
-                    deductions_revealed, _ = self._apply_deductions()
-                else:
-                    deductions_revealed = 0
-                total_new = newly_revealed + deductions_revealed
-                self._last_new_reveals = total_new
-                self.total_new_reveals += float(total_new)
-                reward += float(self.cfg.progress_scale) * float(total_new) / float(total_cells)
+                    self.total_new_reveals += float(newly_revealed)
+                    reward += float(self.cfg.progress_scale) * float(newly_revealed) / float(total_cells)
                 if int(self.revealed.sum()) >= total_safe:
                     done = True
                     outcome = "win"
                     reward += float(self.cfg.win_reward)
         else:
-            # Invalid action (already revealed) -> no reward change, episode continues
+            # Invalid reveal (already open) -> no state change.
             pass
 
         reward -= float(self.cfg.step_penalty)
@@ -181,13 +176,12 @@ class MinesweeperEnv:
 
     # ------------------------ Internal helpers ------------------------
     def _build_aux(self) -> Dict[str, Any]:
-        total_cells = self.H * self.W
+        total_cells = self.cell_count
         revealed_frac = float(int(self.revealed.sum()) / max(1, total_cells))
         return {
             "step": int(self.step_count),
             "last_new_reveals": int(self._last_new_reveals),
             "revealed_frac": revealed_frac,
-            "toggles": 0,
         }
 
     def _build_obs(self) -> np.ndarray:
@@ -216,13 +210,10 @@ class MinesweeperEnv:
             np.copyto(obs[ch], frontier, casting="unsafe")
             ch += 1
 
-        if self.cfg.include_remaining_mines_channel:
-            remaining_ratio = self._remaining_mines_ratio()
-            obs[ch].fill(float(remaining_ratio))
-            ch += 1
+        # remaining mines channel removed
 
         if self.cfg.include_progress_channel:
-            safe_total = max(1, self.A - int(self.cfg.mine_count))
+            safe_total = max(1, self.cell_count - int(self.cfg.mine_count))
             progress = float(self.revealed.sum()) / float(safe_total)
             obs[ch].fill(progress)
             ch += 1
@@ -230,9 +221,8 @@ class MinesweeperEnv:
         return obs.copy()
 
     def _compute_action_mask(self) -> np.ndarray:
-        # Only unrevealed cells are valid actions
-        unrevealed = ~self.revealed
-        return unrevealed.reshape(-1).astype(bool, copy=False)
+        reveal_candidates = (~self.revealed)
+        return reveal_candidates.reshape(-1).astype(bool, copy=False)
 
     def _reveal_with_flood_fill(self, r: int, c: int) -> int:
         """Reveal cell (r,c) with flood-fill expansion for zero tiles."""
@@ -338,13 +328,7 @@ class MinesweeperEnv:
         frontier &= unknown
         return frontier
 
-    def _remaining_mines_ratio(self) -> float:
-        total_mines = int(self.cfg.mine_count)
-        if total_mines <= 0:
-            return 0.0
-        flagged_true = int((self.flags & self.mine_mask).sum()) if self.first_click_done else 0
-        remaining = max(0, total_mines - flagged_true)
-        return float(remaining) / float(total_mines)
+    # removed: remaining mines ratio helper
 
     def _place_mines_safe(self, first_click_rc: Tuple[int, int]) -> None:
         r0, c0 = first_click_rc

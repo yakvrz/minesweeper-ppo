@@ -37,25 +37,20 @@ def il_samples(env: MinesweeperEnv, seed: int = 0) -> Iterator[Tuple[np.ndarray,
     d = env.reset()
 
     while True:
-        fm = forced_moves(env)
+        fm = [(a, i) for (a, i) in forced_moves(env) if a == "reveal"]
         if fm:
-            act_type, flat_idx = fm[rng.integers(0, len(fm))]
+            _, flat_idx = fm[rng.integers(0, len(fm))]
             H, W = env.H, env.W
-            action_idx = flat_idx if act_type == "reveal" else flat_idx + H * W
-            yield d["obs"], d["action_mask"], int(action_idx), env.mine_mask.astype(np.float32)
-            # step the env using the chosen forced move to continue trajectory
+            action_idx = int(flat_idx)
+            yield d["obs"], d["action_mask"], action_idx, env.mine_mask.astype(np.float32)
+            # step the env using the chosen forced reveal to continue trajectory
             d, r, done, info = env.step(action_idx)
             if done:
                 d = env.reset()
         else:
             # No forced move; take a random valid reveal to progress
             mask = d["action_mask"].copy()
-            H, W = env.H, env.W
-            reveal_mask = mask[: H * W]
-            valid = np.flatnonzero(reveal_mask)
-            if len(valid) == 0:
-                # fallback: any valid action
-                valid = np.flatnonzero(mask)
+            valid = np.flatnonzero(mask)
             if len(valid) == 0:
                 d = env.reset()
                 continue
@@ -99,7 +94,7 @@ def main():
     gen = il_samples(env, seed=args.seed)
 
     C, H, W = 11, cfg.H, cfg.W
-    A = 2 * H * W
+    A = H * W
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     pbar = tqdm(total=cfg.total_samples, desc="IL samples")
