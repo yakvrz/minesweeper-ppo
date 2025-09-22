@@ -353,16 +353,10 @@ def evaluate(
             cell_idx = action if not is_flag else action - reveal_count
             r_cell, c_cell = divmod(cell_idx, env.W)
             forced_step = (cell_idx in forced_reveals) if not is_flag else (cell_idx in forced_flags)
-            if not is_flag:
-                if cell_idx in module_sets.get("all_safe", set()):
-                    module_hits["all_safe"] += 1
-                if cell_idx in module_sets.get("pair_reveal", set()):
-                    module_hits["pair_reveal"] += 1
-            else:
-                if cell_idx in module_sets.get("all_mine", set()):
-                    module_hits["all_mine"] += 1
-                if cell_idx in module_sets.get("pair_flag", set()):
-                    module_hits["pair_flag"] += 1
+            if cell_idx in module_sets.get("all_safe", set()):
+                module_hits["all_safe"] += 1
+            if cell_idx in module_sets.get("pair_reveal", set()):
+                module_hits["pair_reveal"] += 1
             if forced_step:
                 forced_steps += 1
                 if (not is_flag and not env.mine_mask[r_cell, c_cell]) or (is_flag and env.mine_mask[r_cell, c_cell]):
@@ -534,16 +528,10 @@ def evaluate_vec(
                         true_guess_attempts += 1
                         if (not is_flag and not env.mine_mask[row, col]) or (is_flag and env.mine_mask[row, col]):
                             true_guess_success += 1
-                    if not is_flag:
-                        if cell_idx in module_sets.get("all_safe", set()):
-                            module_hits_vec["all_safe"] += 1
-                        if cell_idx in module_sets.get("pair_reveal", set()):
-                            module_hits_vec["pair_reveal"] += 1
-                    else:
-                        if cell_idx in module_sets.get("all_mine", set()):
-                            module_hits_vec["all_mine"] += 1
-                        if cell_idx in module_sets.get("pair_flag", set()):
-                            module_hits_vec["pair_flag"] += 1
+                    if cell_idx in module_sets.get("all_safe", set()):
+                        module_hits_vec["all_safe"] += 1
+                    if cell_idx in module_sets.get("pair_reveal", set()):
+                        module_hits_vec["pair_reveal"] += 1
 
                 batch, rewards_np, dones_np, infos = vec.step(actions)
                 rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)

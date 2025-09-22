@@ -214,50 +214,65 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
     """Return per-rule forced move sets for analysis (no side effects)."""
 
     revealed: np.ndarray = state.revealed
-    flags: np.ndarray = state.flags
     counts: np.ndarray = state.adjacent_counts
+    mines: np.ndarray = state.mine_mask
     H, W = revealed.shape
-    unknown = (~revealed) & (~flags)
+    unknown = ~revealed
 
     all_safe_reveal: Set[int] = set()
     all_mine_flag: Set[int] = set()
+    pair_reveal: Set[int] = set()
 
     number_cells = np.transpose(np.nonzero(revealed & (counts > 0)))
+    unknown_sets: Dict[Tuple[int, int], Set[int]] = {}
+    mine_counts: Dict[Tuple[int, int], int] = {}
+
     for r, c in number_cells:
         neigh = list(_neighbors(H, W, int(r), int(c)))
-        flagged = sum(1 for (rr, cc) in neigh if flags[rr, cc])
         unknown_cells = [(rr, cc) for (rr, cc) in neigh if unknown[rr, cc]]
         if not unknown_cells:
             continue
-        count_val = int(counts[r, c])
-        if flagged == count_val:
-            for rr, cc in unknown_cells:
-                all_safe_reveal.add(int(rr * W + cc))
-        if flagged + len(unknown_cells) == count_val:
-            for rr, cc in unknown_cells:
-                all_mine_flag.add(int(rr * W + cc))
+        idxs = {int(rr * W + cc) for (rr, cc) in unknown_cells}
+        mine_count = sum(1 for (rr, cc) in unknown_cells if mines[rr, cc])
+        unknown_sets[(r, c)] = idxs
+        mine_counts[(r, c)] = mine_count
+        if mine_count == 0:
+            all_safe_reveal.update(idxs)
+        if mine_count == len(unknown_cells):
+            all_mine_flag.update(idxs)
 
-    base_moves = [("reveal", idx) for idx in all_safe_reveal] + [("flag", idx) for idx in all_mine_flag]
-    pair_reveal: Set[int] = set()
-    pair_flag: Set[int] = set()
-    try:
-        pair_moves = _apply_pair_constraints(revealed, flags, counts, base_moves)
-    except Exception:
-        pair_moves = []
-    for act, idx in pair_moves:
-        idx_int = int(idx)
-        if act == "reveal":
-            if idx_int not in all_safe_reveal:
-                pair_reveal.add(idx_int)
-        elif act == "flag":
-            if idx_int not in all_mine_flag:
-                pair_flag.add(idx_int)
+    keys = list(unknown_sets.keys())
+    for i in range(len(keys)):
+        r1, c1 = keys[i]
+        set1 = unknown_sets[(r1, c1)]
+        if not set1:
+            continue
+        mines1 = mine_counts[(r1, c1)]
+        for j in range(i + 1, len(keys)):
+            r2, c2 = keys[j]
+            set2 = unknown_sets[(r2, c2)]
+            if not set2:
+                continue
+            mines2 = mine_counts[(r2, c2)]
+            if set1.issubset(set2):
+                diff = set2 - set1
+                if diff:
+                    if mines1 == mines2:
+                        pair_reveal.update(diff)
+                    if mines2 - mines1 == len(diff):
+                        all_mine_flag.update(diff)
+            if set2.issubset(set1):
+                diff = set1 - set2
+                if diff:
+                    if mines2 == mines1:
+                        pair_reveal.update(diff)
+                    if mines1 - mines2 == len(diff):
+                        all_mine_flag.update(diff)
 
     return {
         "all_safe": all_safe_reveal,
         "all_mine": all_mine_flag,
         "pair_reveal": pair_reveal,
-        "pair_flag": pair_flag,
     }
 
 
