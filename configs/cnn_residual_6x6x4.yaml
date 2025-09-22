@@ -9,15 +9,15 @@ env:
 
 model:
   name: cnn_residual
-  stem_channels: 160
-  blocks: 8
+  stem_channels: 128
+  blocks: 6
   dropout: 0.05
-  value_hidden: 320
-  tie_reveal_to_belief: true
+  value_hidden: 192
+  tie_reveal_to_belief: false
 
 ppo:
   num_envs: 128
-  steps_per_env: 128
+  steps_per_env: 64
   mini_batches: 8
   ppo_epochs: 3
   gamma: 0.995
@@ -35,11 +35,11 @@ ppo:
 
 training:
   beta_l2: 0.0002
-  early_stop_patience: 40
+  early_stop_patience: 100
   aux_mine_warmup_weight: 0.08
   aux_mine_warmup_updates: 30
   aux_mine_final_weight: 0.05
   aux_mine_decay_power: 1.0
   rollout:
     num_envs: 128
-    steps_per_env: 128
+    steps_per_env: 64
