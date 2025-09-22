@@ -1,12 +1,8 @@
 env:
-  H: 6
-  W: 6
-  mine_count: 4
+  H: 16
+  W: 16
+  mine_count: 40
   guarantee_safe_neighborhood: true
-  solver_preset: zf
-  include_flags_channel: false
-  include_frontier_channel: true
-  include_remaining_mines_channel: false
   include_progress_channel: true
   progress_scale: 0.6
   step_penalty: 0.0001
@@ -35,7 +31,7 @@ ppo:
   max_grad_norm: 0.5
   aux_mine_weight: 0.05
   aux_mine_calib_weight: 0.01
-  total_updates: 200
+  total_updates: 1000
 
 training:
   beta_l2: 0.0002

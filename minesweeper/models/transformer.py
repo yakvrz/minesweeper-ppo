@@ -110,8 +110,6 @@ class TransformerPolicy(nn.Module):
         self,
         board_shape: tuple[int, int],
         *,
-        include_flags_channel: bool = False,
-        include_frontier_channel: bool = False,
         include_remaining_mines_channel: bool = False,
         include_progress_channel: bool = False,
         d_model: int = 128,
@@ -126,8 +124,6 @@ class TransformerPolicy(nn.Module):
         super().__init__()
         self.H, self.W = board_shape
         self.N = self.H * self.W
-        self.include_flags_channel = include_flags_channel
-        self.include_frontier_channel = include_frontier_channel
         # remaining mines channel removed
         self.include_progress_channel = include_progress_channel
         self.tie_reveal_to_belief = bool(tie_reveal_to_belief)
@@ -136,10 +132,6 @@ class TransformerPolicy(nn.Module):
         self._last_beta_reg: Optional[torch.Tensor] = None
 
         token_dim = 1 + 9
-        if include_flags_channel:
-            token_dim += 1
-        if include_frontier_channel:
-            token_dim += 1
         # remaining mines channel removed
         if include_progress_channel:
             token_dim += 1
@@ -225,23 +217,12 @@ class TransformerPolicy(nn.Module):
         revealed = obs[:, offset : offset + 1]
         offset += 1
 
-        flag_feat = None
-        if self.include_flags_channel:
-            flag_feat = obs[:, offset : offset + 1]
-            offset += 1
-
         counts = obs[:, offset : offset + 9]
         offset += 9
 
-        features = [revealed]
-        if flag_feat is not None:
-            features.append(flag_feat)
-        features.append(counts)
+        features = [revealed, counts]
 
-        if self.include_frontier_channel:
-            frontier = obs[:, offset : offset + 1]
-            features.append(frontier)
-            offset += 1
+        # frontier channel removed
         # remaining mines channel removed
         if self.include_progress_channel:
             progress = obs[:, offset : offset + 1]

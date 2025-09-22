@@ -29,10 +29,7 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 
 - `step_penalty` (default `1e-4`)
 - `progress_scale` (default `0.6`)
-- Optional observation channels:
-  - `include_flags_channel`
-  - `include_frontier_channel`
-  - (removed) remaining mines channel
+- Optional observation channel:
   - `include_progress_channel`
 
 ## Metrics to monitor
@@ -50,7 +47,7 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 - `minesweeper/ppo.py`: PPO update (masked)
 - `eval.py`: Evaluation CLI and utilities (`evaluate`, `evaluate_vec`)
 - `viz.py`: ASCII/heatmap utilities
-- `configs/`: YAML configs (see `transformer_small.yaml` for a lighter attention model)
+- `configs/`: YAML configs (`cnn_residual_6x6x4.yaml`, `cnn_residual_8x8x10.yaml`, `cnn_residual_16x16x40.yaml`)
 - `scripts/`: Helper scripts (`sweep_relpos.py` to scan relative attention radius)
 
 See `ARCHITECTURE.md` for full details.

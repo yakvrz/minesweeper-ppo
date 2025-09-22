@@ -344,6 +344,8 @@ def main() -> None:
         "guarantee_safe_neighborhood": cfg.guarantee_safe_neighborhood,
     }
     env_kwargs.update(env_overrides)
+    # Remove deprecated/unsupported keys for robustness
+    env_kwargs.pop("include_frontier_channel", None)
     env_cfg = EnvConfig(**env_kwargs)
     late_start_cfg = None
     if isinstance(training_opts, dict):
@@ -366,8 +368,6 @@ def main() -> None:
     model_cfg_local = dict(model_cfg)
     model_name = args.model or model_cfg_local.pop("name", "cnn")
     env_flag_overrides = {
-        "include_flags_channel": env_cfg.include_flags_channel,
-        "include_frontier_channel": env_cfg.include_frontier_channel,
         "include_progress_channel": env_cfg.include_progress_channel,
     }
     model = build_model(

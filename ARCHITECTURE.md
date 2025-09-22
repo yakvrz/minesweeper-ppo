@@ -84,15 +84,9 @@ Vectorized wrapper `VecMinesweeper` batches N environments on CPU and provides `
 Default channels, shape `(C, H, W)`:
 
 1. `revealed` – {0,1}
-2. `flags` – {0,1} (optional, auto-maintained by the environment’s deduction loop; the agent never issues flag actions)
-3. `adjacent_counts_onehot` – 9 channels for values 0..8; *only* active where `revealed=1`, else all-zero.
+2. `adjacent_counts_onehot` – 9 channels for values 0..8; *only* active where `revealed=1`, else all-zero.
 
-Optional helper planes (configurable): frontier mask, remaining mines ratio (broadcast), progress scalar (broadcast).
-
-Optional fast-learning helpers (can be toggled later):
-
-* `frontier` – unknown cells adjacent to any revealed number (1/0)
-* Broadcast scalars (e.g., `remaining_mines_ratio`, `progress`) added as extra channels by repeating over `(H,W)`.
+Optional helper plane (configurable): broadcast `progress` scalar repeated over `(H,W)`.
 
 ---
 
@@ -171,7 +165,7 @@ Use this for the lightweight baseline or when experimenting on CPUs without atte
 
 ### TransformerPolicy (token-per-cell)
 
-* Tokens: one per cell with features `[revealed, one-hot(0..8), optional frontier, remaining_mines_ratio, progress]`. Flags channel (if enabled) is also wired through.
+* Tokens: one per cell with features `[revealed, one-hot(0..8), optional progress scalar]`.
 * Positional encoding: learned row/column embeddings `E_row[r] + E_col[c]` plus optional 2-D relative bias (radius ≤ 4) inside attention.
 * Backbone: `L` pre-norm Transformer encoder blocks (`d_model=128`, `num_heads=8`, `mlp_ratio=2.0` by default).
 * Heads:
@@ -232,7 +226,6 @@ Mixed precision and `torch.compile()` remain recommended for both variants on Py
 
 * Initialize from IL checkpoint (if used).
 * Turn on progress shaping, step penalty, terminal rewards.
-* Optionally enable early **frontier masking**; relax after N updates.
 * Add curriculum: once eval win-rate > threshold on current board, include the next harder board in a mixture schedule.
 
 ---
@@ -280,7 +273,7 @@ Mixed precision and `torch.compile()` remain recommended for both variants on Py
 
 ## Configuration
 
-Example `configs/small_8x8_10.yaml`:
+Example `configs/cnn_residual_8x8x10.yaml`:
 
 ```yaml
 env:
@@ -288,22 +281,20 @@ env:
   W: 8
   mine_count: 10
   guarantee_safe_neighborhood: true
-  step_penalty: 0.0001
-  progress_scale: 0.6
-  include_frontier_channel: true
-  # remaining mines channel removed
   include_progress_channel: true
+  progress_scale: 0.6
+  step_penalty: 0.0001
 
 model:
-  name: transformer
-  d_model: 128
-  depth: 6
-  num_heads: 8
-  mlp_ratio: 2.0
-  rel_pos_radius: 4
+  name: cnn_residual
+  stem_channels: 160
+  blocks: 8
+  dropout: 0.05
+  value_hidden: 320
+  tie_reveal_to_belief: true
 
 ppo:
-  num_envs: 256
+  num_envs: 128
   steps_per_env: 128
   mini_batches: 8
   ppo_epochs: 3
@@ -311,10 +302,25 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.0015
+  ent_coef: 0.002
+  ent_coef_min: 0.0010
+  ent_decay_updates: 300
   lr: 0.0003
   max_grad_norm: 0.5
-  aux_mine_weight: 0.15
+  aux_mine_weight: 0.05
+  aux_mine_calib_weight: 0.01
+  total_updates: 1000
+
+training:
+  beta_l2: 0.0002
+  early_stop_patience: 40
+  aux_mine_warmup_weight: 0.08
+  aux_mine_warmup_updates: 30
+  aux_mine_final_weight: 0.05
+  aux_mine_decay_power: 1.0
+  rollout:
+    num_envs: 128
+    steps_per_env: 128
 ```
 
 ---

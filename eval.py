@@ -613,7 +613,12 @@ def main():
     # Env config
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
-    env_cfg = EnvConfig(**cfg["env"]) if "env" in cfg else EnvConfig(**cfg)
+    if "env" in cfg:
+        env_d = dict(cfg["env"]) or {}
+    else:
+        env_d = dict(cfg) or {}
+    env_d.pop("include_frontier_channel", None)
+    env_cfg = EnvConfig(**env_d)
 
     # Determine observation channels dynamically
     probe_vec = VecMinesweeper(num_envs=1, cfg=env_cfg, seed=0)
@@ -630,8 +635,6 @@ def main():
     model_cfg.pop("name", None)
     model_name = args.model or model_meta.get("name", "cnn")
     env_flag_defaults = {
-        "include_flags_channel": env_cfg.include_flags_channel,
-        "include_frontier_channel": env_cfg.include_frontier_channel,
         "include_progress_channel": env_cfg.include_progress_channel,
     }
     env_flag_overrides = dict(env_flag_defaults)

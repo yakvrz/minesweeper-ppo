@@ -1,13 +1,9 @@
 env:
-  H: 12
-  W: 12
-  mine_count: 20
+  H: 8
+  W: 8
+  mine_count: 10
   guarantee_safe_neighborhood: true
-  solver_preset: zf_chord
-  include_flags_channel: false
-  include_frontier_channel: true
   include_progress_channel: true
-  include_remaining_mines_channel: true
   progress_scale: 0.6
   step_penalty: 0.0001
 
@@ -28,19 +24,21 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.0015
-  ent_coef_min: 0.0012
-  ent_decay_updates: 200
+  ent_coef: 0.002
+  ent_coef_min: 0.0010
+  ent_decay_updates: 300
   lr: 0.0003
   max_grad_norm: 0.5
-  aux_mine_weight: 0.02
+  aux_mine_weight: 0.05
+  aux_mine_calib_weight: 0.01
+  total_updates: 1000
 
 training:
-  beta_l2: 0.0001
+  beta_l2: 0.0002
   early_stop_patience: 40
-  aux_mine_warmup_weight: 0.04
+  aux_mine_warmup_weight: 0.08
   aux_mine_warmup_updates: 30
-  aux_mine_final_weight: 0.02
+  aux_mine_final_weight: 0.05
   aux_mine_decay_power: 1.0
   rollout:
     num_envs: 128

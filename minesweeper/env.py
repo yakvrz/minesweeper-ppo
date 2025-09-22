@@ -30,8 +30,7 @@ class EnvConfig:
     step_penalty: float = 1e-4
     progress_scale: float = 0.6
 
-    include_flags_channel: bool = False
-    include_frontier_channel: bool = False
+    # flags channel removed
     # removed remaining mines ratio channel
     include_progress_channel: bool = False
 
@@ -41,9 +40,8 @@ class MinesweeperEnv:
 
     Observation encoding (C,H,W) is dynamic:
       - revealed mask {0,1}
-      - optional flags mask {0,1} (if include_flags_channel)
       - nine one-hot planes for adjacent counts 0..8 (active only where revealed=1)
-      - optional helper channels (frontier, remaining mines ratio, progress scalar)
+      - optional helper channels (progress scalar)
     """
 
     def __init__(self, cfg: EnvConfig, seed: int = 0):
@@ -60,7 +58,6 @@ class MinesweeperEnv:
         self._obs_channel_count = self._calc_obs_channels()
         self._obs_buffer = np.zeros((self._obs_channel_count, self.H, self.W), dtype=np.float32)
         self._onehot_buffer = np.zeros((9, self.H, self.W), dtype=np.float32)
-        self._frontier_buffer = np.zeros((self.H, self.W), dtype=bool)
         self._pad_buffer = np.zeros((self.H + 2, self.W + 2), dtype=bool)
         self._shift_buffer = np.zeros((self.H, self.W), dtype=bool)
         self._forbidden_buffer = np.zeros((self.H, self.W), dtype=bool)
@@ -88,11 +85,8 @@ class MinesweeperEnv:
     # ------------------------ Public API ------------------------
     def _calc_obs_channels(self) -> int:
         channels = 1  # revealed
-        if self.cfg.include_flags_channel:
-            channels += 1
         channels += 9  # counts 0..8
-        if self.cfg.include_frontier_channel:
-            channels += 1
+        # frontier channel removed
         # remaining mines channel removed
         if self.cfg.include_progress_channel:
             channels += 1
@@ -191,10 +185,6 @@ class MinesweeperEnv:
         np.copyto(obs[ch], self.revealed, casting="unsafe")
         ch += 1
 
-        if self.cfg.include_flags_channel:
-            np.copyto(obs[ch], self.flags, casting="unsafe")
-            ch += 1
-
         onehot = self._onehot_buffer
         onehot.fill(0.0)
         if self.first_click_done:
@@ -205,11 +195,7 @@ class MinesweeperEnv:
         obs[ch : ch + 9] = onehot
         ch += 9
 
-        if self.cfg.include_frontier_channel:
-            frontier = self._compute_frontier()
-            np.copyto(obs[ch], frontier, casting="unsafe")
-            ch += 1
-
+        # frontier channel removed
         # remaining mines channel removed
 
         if self.cfg.include_progress_channel:
@@ -304,31 +290,7 @@ class MinesweeperEnv:
 
         return total_revealed, total_flagged
 
-    def _compute_frontier(self) -> np.ndarray:
-        frontier = self._frontier_buffer
-        frontier.fill(False)
-        if not self.first_click_done:
-            return frontier
-        number_cells = self.revealed & (self.adjacent_counts > 0)
-        if not number_cells.any():
-            return frontier
-        pad = self._pad_buffer
-        pad.fill(False)
-        pad[1:-1, 1:-1] = number_cells
-
-        np.logical_or(frontier, pad[:-2, :-2], out=frontier)
-        np.logical_or(frontier, pad[:-2, 1:-1], out=frontier)
-        np.logical_or(frontier, pad[:-2, 2:], out=frontier)
-        np.logical_or(frontier, pad[1:-1, :-2], out=frontier)
-        np.logical_or(frontier, pad[1:-1, 2:], out=frontier)
-        np.logical_or(frontier, pad[2:, :-2], out=frontier)
-        np.logical_or(frontier, pad[2:, 1:-1], out=frontier)
-        np.logical_or(frontier, pad[2:, 2:], out=frontier)
-        unknown = (~self.revealed) & (~self.flags)
-        frontier &= unknown
-        return frontier
-
-    # removed: remaining mines ratio helper
+    # frontier helper removed; remaining mines ratio helper removed
 
     def _place_mines_safe(self, first_click_rc: Tuple[int, int]) -> None:
         r0, c0 = first_click_rc
