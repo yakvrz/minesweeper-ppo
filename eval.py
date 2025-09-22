@@ -734,8 +734,13 @@ def main():
     summary = {"checkpoint": os.path.basename(ckpt_path), "model": model_name, **metrics}
     if args.run_dir or args.ckpt:
         print("Evaluation summary:")
+        def _fmt(value):
+            if isinstance(value, float):
+                return f"{value:.6f}"
+            return str(value)
+
         for key in sorted(summary.keys()):
-            print(f"  {key:20s}: {summary[key]}")
+            print(f"  {key:20s}: {_fmt(summary[key])}")
     else:
         print(json.dumps(summary), flush=True)
 
