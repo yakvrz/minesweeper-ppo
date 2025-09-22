@@ -395,13 +395,14 @@ def evaluate(
         "avg_steps": total_steps / episodes,
         "avg_progress": total_progress / episodes,
         "invalid_rate": invalids / max(1, total_steps),
-        "forced_move_recall": (forced_correct / forced_steps) if forced_steps else float("nan"),
         "forced_move_steps": forced_steps,
         "true_guess_success_rate": (true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
         "true_guess_attempts": true_guess_attempts,
     }
     for mod, occ in module_occ.items():
         result[f"{mod}_recall"] = (module_hits[mod] / occ) if occ else float("nan")
+    for mod in ["all_safe", "pair_reveal"]:
+        result.setdefault(f"{mod}_recall", float("nan"))
     return result
 
 
@@ -597,31 +598,26 @@ def evaluate_vec(
         belief_auroc = float('nan')
         belief_ece = float('nan')
 
-    total_guess_attempts = true_guess_attempts
-    total_guess_success = true_guess_success
-
     result = {
         "win_rate": wins / max(1, episodes),
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
-        "guesses_per_episode": total_guess_attempts / max(1, episodes),
-        "guess_success_rate": total_guess_success / max(1, total_guess_attempts) if total_guess_attempts else 0.0,
-        "forced_move_recall": (forced_correct_steps / forced_steps) if forced_steps else float("nan"),
+        "guesses_per_episode": true_guess_attempts / max(1, episodes),
+        "guess_success_rate": true_guess_success / max(1, true_guess_attempts) if true_guess_attempts else 0.0,
         "forced_move_steps": forced_steps,
         "forced_move_correct_steps": forced_correct_steps,
-        "true_guess_success_rate": (true_guess_success / true_guess_attempts) if true_guess_attempts else float("nan"),
-        "true_guess_attempts": true_guess_attempts,
-        "true_guess_success": true_guess_success,
         "belief_auroc": belief_auroc,
         "belief_ece": belief_ece,
         "episodes": int(episodes),
         "wins": int(wins),
-        "total_guess_attempts": int(total_guess_attempts),
-        "total_guess_success": int(total_guess_success),
+        "guess_attempts": int(true_guess_attempts),
+        "guess_successes": int(true_guess_success),
     }
     for mod, occ in module_occ_vec.items():
         result[f"{mod}_recall"] = (module_hits_vec[mod] / occ) if occ else float("nan")
+    for mod in ["all_safe", "pair_reveal"]:
+        result.setdefault(f"{mod}_recall", float("nan"))
     return result
 
 
@@ -733,14 +729,58 @@ def main():
 
     summary = {"checkpoint": os.path.basename(ckpt_path), "model": model_name, **metrics}
     if args.run_dir or args.ckpt:
-        print("Evaluation summary:")
         def _fmt(value):
+            if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                return "nan"
             if isinstance(value, float):
-                return f"{value:.6f}"
+                return f"{value:.3f}"
             return str(value)
 
-        for key in sorted(summary.keys()):
-            print(f"  {key:20s}: {_fmt(summary[key])}")
+        sections = [
+            ("Model", ["checkpoint", "model"]),
+            (
+                "Core Performance",
+                ["win_rate", "avg_steps", "avg_progress", "invalid_rate"],
+            ),
+            (
+                "Guess Metrics",
+                [
+                    "guesses_per_episode",
+                    "guess_success_rate",
+                    "guess_attempts",
+                    "guess_successes",
+                ],
+            ),
+            (
+                "Forced Move Recall",
+                [
+                    "all_safe_recall",
+                    "pair_reveal_recall",
+                ],
+            ),
+            (
+                "Belief Quality",
+                ["belief_auroc", "belief_ece"],
+            ),
+        ]
+
+        seen_keys = set()
+        print("Evaluation summary:")
+        for heading, keys in sections:
+            present = any(k in summary for k in keys)
+            if not present:
+                continue
+            print(f"\n{heading}:")
+            for key in keys:
+                value = summary.get(key)
+                seen_keys.add(key)
+                print(f"  {key:20s}: {_fmt(value)}")
+
+        other_keys = sorted(k for k in summary.keys() if k not in seen_keys)
+        if other_keys:
+            print("\nOther metrics:")
+            for key in other_keys:
+                print(f"  {key:20s}: {_fmt(summary[key])}")
     else:
         print(json.dumps(summary), flush=True)
 

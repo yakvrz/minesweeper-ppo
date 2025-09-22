@@ -220,7 +220,6 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
     unknown = ~revealed
 
     all_safe_reveal: Set[int] = set()
-    all_mine_flag: Set[int] = set()
     pair_reveal: Set[int] = set()
 
     number_cells = np.transpose(np.nonzero(revealed & (counts > 0)))
@@ -239,7 +238,8 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
         if mine_count == 0:
             all_safe_reveal.update(idxs)
         if mine_count == len(unknown_cells):
-            all_mine_flag.update(idxs)
+            # this is a forced flag scenario; skip because agent does not flag
+            pass
 
     keys = list(unknown_sets.keys())
     for i in range(len(keys)):
@@ -260,18 +260,19 @@ def analyze_forced_modules(state) -> Dict[str, Set[int]]:
                     if mines1 == mines2:
                         pair_reveal.update(diff)
                     if mines2 - mines1 == len(diff):
-                        all_mine_flag.update(diff)
+                        # would imply forced flags; ignore for reveal-only policy
+                        pass
             if set2.issubset(set1):
                 diff = set1 - set2
                 if diff:
                     if mines2 == mines1:
                         pair_reveal.update(diff)
                     if mines1 - mines2 == len(diff):
-                        all_mine_flag.update(diff)
+                        # forced flags ignored
+                        pass
 
     return {
         "all_safe": all_safe_reveal,
-        "all_mine": all_mine_flag,
         "pair_reveal": pair_reveal,
     }
 
