@@ -615,6 +615,8 @@ def main() -> None:
             "quick_guess_success": None,
             "quick_belief_auroc": None,
             "quick_belief_ece": None,
+            "quick_forced_guess_rate": None,
+            "quick_safe_option_pick_rate": None,
             "quick_score": None,
         })
 
@@ -645,15 +647,21 @@ def main() -> None:
                 row["quick_win_rate"] = win_quick
                 row["quick_belief_auroc"] = metrics_quick.get("belief_auroc")
                 row["quick_belief_ece"] = metrics_quick.get("belief_ece")
+                row["quick_forced_guess_rate"] = metrics_quick.get("forced_guess_rate")
+                row["quick_safe_option_pick_rate"] = metrics_quick.get("safe_option_pick_rate")
                 score = _quick_eval_score(metrics_quick)
                 row["quick_score"] = score
                 auroc = row["quick_belief_auroc"]
+                forced_rate = row["quick_forced_guess_rate"]
+                safe_pick_rate = row["quick_safe_option_pick_rate"]
                 log.info(
-                    "quick eval upd %d: win_rate=%.3f avg_steps=%.2f auroc=%.3f score=%.3f",
+                    "quick eval upd %d: win_rate=%.3f avg_steps=%.2f auroc=%.3f forced=%.3f safe_pick=%.3f score=%.3f",
                     update + 1,
                     win_quick,
                     metrics_quick.get("avg_steps", float('nan')),
                     float(auroc) if auroc is not None else float('nan'),
+                    float(forced_rate) if forced_rate is not None else float('nan'),
+                    float(safe_pick_rate) if safe_pick_rate is not None else float('nan'),
                     score,
                 )
                 if score > best_quick_score or best_update < 0:
