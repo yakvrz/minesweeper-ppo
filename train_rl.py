@@ -367,13 +367,10 @@ def main() -> None:
 
     model_cfg_local = dict(model_cfg)
     model_name = args.model or model_cfg_local.pop("name", "cnn")
-    env_flag_overrides = {
-        "include_progress_channel": env_cfg.include_progress_channel,
-    }
     model = build_model(
         model_name,
         obs_shape=obs_shape,
-        env_overrides=env_flag_overrides,
+        env_overrides=None,
         model_cfg=model_cfg_local,
     ).to(device)
 
@@ -387,7 +384,6 @@ def main() -> None:
     model_meta = {
         "name": model_name,
         "config": dict(model_cfg_local),
-        "env_flags": env_flag_overrides,
     }
 
     log.info(f"Model: {model_name} | params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")

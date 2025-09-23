@@ -27,16 +27,13 @@ def build_model(
     if name == "cnn":
         in_channels = obs_shape[0]
         hidden = int(cfg.pop("hidden", 64))
-        tie_reveal = bool(cfg.pop("tie_reveal_to_belief", False))
         return CNNPolicy(
             in_channels=in_channels,
             hidden=hidden,
-            tie_reveal_to_belief=tie_reveal,
         )
 
     if name in {"cnn_residual", "cnn_large"}:
         in_channels = obs_shape[0]
-        tie_reveal = bool(cfg.pop("tie_reveal_to_belief", False))
         stem_channels = int(cfg.pop("stem_channels", 128))
         blocks = int(cfg.pop("blocks", 6))
         dropout = float(cfg.pop("dropout", 0.05))
@@ -47,7 +44,6 @@ def build_model(
             blocks=blocks,
             dropout=dropout,
             value_hidden=value_hidden,
-            tie_reveal_to_belief=tie_reveal,
         )
 
     raise ValueError(f"Unknown model name: {name}")

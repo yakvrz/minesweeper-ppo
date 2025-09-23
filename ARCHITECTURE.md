@@ -109,9 +109,6 @@ masked_logits = logits.masked_fill(~action_mask, -1e9)
 
   * Win: `+1.0`
   * Loss: `-1.0`
-* **Progress shaping**:
-
-  * `+ (progress_scale * new_safe / (H * W))` per step, where `new_safe` is the number of freshly revealed safe cells after the closure cascade.
 * **Step penalty**: small constant subtraction each move (default `1e-4`).
 * Flag shaping is removed—the environment manages flags automatically during the closure.
 
@@ -265,8 +262,6 @@ env:
   W: 8
   mine_count: 10
   guarantee_safe_neighborhood: true
-  include_progress_channel: true
-  progress_scale: 0.6
   step_penalty: 0.0001
 
 model:
@@ -275,7 +270,6 @@ model:
   blocks: 8
   dropout: 0.05
   value_hidden: 320
-  tie_reveal_to_belief: true
 
 ppo:
   num_envs: 128

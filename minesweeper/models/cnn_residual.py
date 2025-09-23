@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class _ResidualBlock(nn.Module):
@@ -41,7 +38,6 @@ class CNNResidualPolicy(nn.Module):
         blocks: int = 6,
         dropout: float = 0.05,
         value_hidden: int = 256,
-        tie_reveal_to_belief: bool = False,
     ) -> None:
         super().__init__()
         if stem_channels <= 0:
@@ -80,19 +76,6 @@ class CNNResidualPolicy(nn.Module):
             nn.Conv2d(stem_channels, 1, kernel_size=1),
         )
 
-        self.tie_reveal_to_belief = bool(tie_reveal_to_belief)
-        if self.tie_reveal_to_belief:
-            self.belief_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
-            self.belief_policy_proj = nn.Sequential(
-                nn.LayerNorm(stem_channels),
-                nn.Linear(stem_channels, 2),
-            )
-        else:
-            self.belief_pool = None
-            self.belief_policy_proj = None
-
-        self._last_beta_reg: Optional[torch.Tensor] = None
-
     def set_gradient_checkpointing(self, enabled: bool) -> None:  # pragma: no cover
         # Placeholder for API compatibility; no gradient checkpointing is used here.
         return None
@@ -102,36 +85,14 @@ class CNNResidualPolicy(nn.Module):
         f = self.residual_stack(f)
 
         B, _, H, W = f.shape
-        mine_logits_map: Optional[torch.Tensor] = None
-        mine_logits_flat: Optional[torch.Tensor] = None
-        if return_mine or self.tie_reveal_to_belief:
-            mine_logits_map = self.mine_head(f)
-            mine_logits_flat = mine_logits_map.view(B, -1)
-
-        if self.tie_reveal_to_belief:
-            assert self.belief_pool is not None and self.belief_policy_proj is not None
-            pooled = self.belief_pool(f)
-            params = self.belief_policy_proj(pooled)
-            beta_raw, bias = params.split(1, dim=-1)
-            beta = F.softplus(beta_raw) + 1e-3
-            self._last_beta_reg = (beta ** 2).mean()
-            if mine_logits_flat is None:
-                mine_logits_map = self.mine_head(f)
-                mine_logits_flat = mine_logits_map.view(B, -1)
-            policy_logits_flat = (-beta * mine_logits_flat + bias).view(B, H * W)
-        else:
-            self._last_beta_reg = None
-            logits = self.policy_head(f)
-            policy_logits_flat = logits.permute(0, 2, 3, 1).reshape(B, H * W)
+        logits = self.policy_head(f)
+        policy_logits_flat = logits.permute(0, 2, 3, 1).reshape(B, H * W)
 
         value = self.value_head(f).squeeze(-1)
         if return_mine:
-            if mine_logits_map is None:
-                mine_logits_map = self.mine_head(f)
+            mine_logits_map = self.mine_head(f)
             return policy_logits_flat, value, mine_logits_map
         return policy_logits_flat, value
 
     def beta_regularizer(self) -> torch.Tensor:
-        if self._last_beta_reg is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        return self._last_beta_reg
+        return next(self.parameters()).new_zeros(())

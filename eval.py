@@ -528,18 +528,13 @@ def main():
     model_cfg = dict(model_meta.get("config", {}))
     model_cfg.pop("name", None)
     model_name = args.model or model_meta.get("name", "cnn")
-    env_flag_defaults = {
-        "include_progress_channel": env_cfg.include_progress_channel,
-    }
-    env_flag_overrides = dict(env_flag_defaults)
-    env_flag_overrides.update(model_meta.get("env_flags", {}))
     obs_shape = (in_channels, env_cfg.H, env_cfg.W)
 
     # Build model to match training configuration
     model = build_model(
         model_name,
         obs_shape=obs_shape,
-        env_overrides=env_flag_overrides,
+        env_overrides=None,
         model_cfg=model_cfg,
     ).to(device)
     state_dict = dict(state["model"]) if isinstance(state, dict) and "model" in state else state

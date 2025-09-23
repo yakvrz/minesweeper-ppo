@@ -5,6 +5,7 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 ## Quickstart
 
 - Install deps: `pip install -r requirements.txt`
+- Recommended: set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before training to reduce CUDA memory fragmentation (e.g., `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
 - Play locally: `python scripts/play_local.py`
 - PPO training (CNN): `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
 - Evaluate latest checkpoint: `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
@@ -17,7 +18,6 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 The environment now auto-applies all provable deductions after each reveal (flags + safe reveals + chord). Rewards are:
 
 - `+1 / -1` on win/loss
-- `+(progress_scale * new_safe / (H×W))` per step for newly revealed safe cells
 - `-step_penalty` each step for mild efficiency pressure
 
 No explicit flag actions or penalties remain—the agent purely learns where to reveal.
@@ -25,11 +25,6 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 ### Env config knobs
 
 - `step_penalty` (default `1e-4`)
-- `progress_scale` (default `0.6`)
-- Optional observation channel:
-  - `include_progress_channel`
-
-## Metrics to monitor
 
 - Win rate (primary) and average steps from the reveal-only evaluation.
 - Average normalized progress (`avg_progress`).

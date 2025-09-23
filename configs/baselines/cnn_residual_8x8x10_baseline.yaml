@@ -3,21 +3,18 @@ env:
   W: 8
   mine_count: 10
   guarantee_safe_neighborhood: true
-  include_progress_channel: true
-  progress_scale: 0.6
   step_penalty: 0.0001
 
 model:
   name: cnn_residual
-  stem_channels: 128
-  blocks: 6
+  stem_channels: 96
+  blocks: 4
   dropout: 0.05
-  value_hidden: 256
-  tie_reveal_to_belief: false
+  value_hidden: 192
 
 ppo:
-  num_envs: 256
-  steps_per_env: 128
+  num_envs: 192
+  steps_per_env: 64
   mini_batches: 8
   ppo_epochs: 3
   gamma: 0.995
@@ -41,6 +38,5 @@ training:
   aux_mine_final_weight: 0.05
   aux_mine_decay_power: 1.0
   rollout:
-    num_envs: 256
-    steps_per_env: 128
-
+    num_envs: 192
+    steps_per_env: 64

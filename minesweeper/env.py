@@ -28,20 +28,14 @@ class EnvConfig:
     win_reward: float = 1.0
     loss_reward: float = -1.0
     step_penalty: float = 1e-4
-    progress_scale: float = 0.6
-
-    # flags channel removed
-    # removed remaining mines ratio channel
-    include_progress_channel: bool = False
 
 
 class MinesweeperEnv:
     """Single Minesweeper environment running on CPU with NumPy state.
 
-    Observation encoding (C,H,W) is dynamic:
+    Observation encoding (C,H,W):
       - revealed mask {0,1}
       - nine one-hot planes for adjacent counts 0..8 (active only where revealed=1)
-      - optional helper channels (progress scalar)
     """
 
     def __init__(self, cfg: EnvConfig, seed: int = 0):
@@ -88,8 +82,6 @@ class MinesweeperEnv:
         channels += 9  # counts 0..8
         # frontier channel removed
         # remaining mines channel removed
-        if self.cfg.include_progress_channel:
-            channels += 1
         return channels
 
     def reset(self) -> Dict[str, Any]:
@@ -139,7 +131,6 @@ class MinesweeperEnv:
                 self._last_new_reveals = newly_revealed
                 if newly_revealed > 0:
                     self.total_new_reveals += float(newly_revealed)
-                    reward += float(self.cfg.progress_scale) * float(newly_revealed) / float(total_cells)
                 if int(self.revealed.sum()) >= total_safe:
                     done = True
                     outcome = "win"
@@ -197,12 +188,6 @@ class MinesweeperEnv:
 
         # frontier channel removed
         # remaining mines channel removed
-
-        if self.cfg.include_progress_channel:
-            safe_total = max(1, self.cell_count - int(self.cfg.mine_count))
-            progress = float(self.revealed.sum()) / float(safe_total)
-            obs[ch].fill(progress)
-            ch += 1
 
         return obs.copy()
 
