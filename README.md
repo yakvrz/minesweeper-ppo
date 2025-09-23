@@ -37,7 +37,7 @@ No explicit flag actions or penalties remain—the agent purely learns where to 
 - `minesweeper/models.py`: CNN-based policies with shared builder (`build_model`)
 - `minesweeper/buffers.py`: PPO rollout buffer with GAE
 - `minesweeper/ppo.py`: PPO update (masked)
-- `eval.py`: Evaluation CLI and utilities (`evaluate`, `evaluate_vec`)
+- `eval.py`: Evaluation CLI and utilities. Reports win rate, belief calibration, and new avoidability metrics (`forced_guess_rate`, `safe_option_rate`, `safe_option_pick_rate`, etc.) that quantify how often the agent truly has to guess versus skipping provably safe tiles.
 - `viz.py`: ASCII/heatmap utilities
 - `configs/`: YAML configs (`cnn_residual_6x6x4.yaml`, `cnn_residual_8x8x10.yaml`, `cnn_residual_16x16x40.yaml`)
 - `scripts/`: Helper scripts (e.g., `play_local.py` for interactive play)

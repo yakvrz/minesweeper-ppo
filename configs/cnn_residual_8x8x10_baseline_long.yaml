@@ -1,0 +1,38 @@
+env:
+  H: 8
+  W: 8
+  mine_count: 10
+  guarantee_safe_neighborhood: true
+  step_penalty: 0.0001
+
+model:
+  name: cnn_residual
+  stem_channels: 96
+  blocks: 4
+  dropout: 0.05
+  value_hidden: 192
+
+ppo:
+  num_envs: 192
+  steps_per_env: 64
+  mini_batches: 8
+  ppo_epochs: 3
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.003
+  ent_coef_min: 0.0010
+  ent_decay_updates: 400
+  lr: 0.0003
+  max_grad_norm: 0.5
+  aux_mine_weight: 0.05
+  aux_mine_calib_weight: 0.01
+  total_updates: 3000
+
+training:
+  beta_l2: 0.0
+  early_stop_patience: 200
+  rollout:
+    num_envs: 192
+    steps_per_env: 64

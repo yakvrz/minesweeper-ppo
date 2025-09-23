@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import yaml
 
+from minesweeper.avoidability import analyze_avoidability
 from minesweeper.env import EnvConfig, MinesweeperEnv, VecMinesweeper
 from minesweeper.models import build_model
 from minesweeper.rules import forced_moves, analyze_forced_modules
@@ -290,11 +291,15 @@ def evaluate_vec(
     invalids = 0
     # Guessing metrics
     reveal_total = 0
-    unavoidable_total = 0
-    unavoidable_success_total = 0
-    unavoidable_episode_total = 0
-    total_guess_attempts = 0
-    total_guess_success = 0
+    forced_guess_total = 0
+    forced_guess_success_total = 0
+    forced_guess_episode_total = 0
+    safe_option_total = 0
+    safe_option_misses = 0
+    safe_option_hits = 0
+    safe_cells_accumulator = 0
+    component_sizes_all: List[int] = []
+    chosen_component_sizes: List[int] = []
     belief_probs: list[np.ndarray] = []
     belief_labels: list[np.ndarray] = []
     forced_steps = 0
@@ -373,14 +378,24 @@ def evaluate_vec(
                     if cell_idx in module_sets.get("subset_reveal", set()):
                         module_hits_vec["subset_reveal"] += 1
 
-                    # Unavoidable guess accounting (no forced reveals available)
-                    # All actions are reveals in this setup, so count per action.
-                    reveal_total += 1
-                    if len(forced_reveals) == 0:
-                        unavoidable_total += 1
-                        ep_unavoidable[idx] = True
-                        if not env.mine_mask[row, col]:
-                            unavoidable_success_total += 1
+                    if env.first_click_done:
+                        analysis = analyze_avoidability(env, cell_idx)
+                        component_sizes_all.extend(analysis.component_sizes)
+                        if analysis.chosen_component_size is not None:
+                            chosen_component_sizes.append(analysis.chosen_component_size)
+                        reveal_total += 1
+                        if analysis.avoidable:
+                            safe_option_total += 1
+                            safe_cells_accumulator += analysis.count_forced_safe_cells
+                            if analysis.chosen_is_forced_safe:
+                                safe_option_hits += 1
+                            else:
+                                safe_option_misses += 1
+                        else:
+                            forced_guess_total += 1
+                            ep_unavoidable[idx] = True
+                            if not env.mine_mask[row, col]:
+                                forced_guess_success_total += 1
 
                 batch, rewards_np, dones_np, infos = vec.step(actions)
                 rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
@@ -404,7 +419,7 @@ def evaluate_vec(
                         counted[i] = True
                         finished += 1
                         if ep_unavoidable[i]:
-                            unavoidable_episode_total += 1
+                            forced_guess_episode_total += 1
                         # controller removed
                     if not counted[i] and max_steps_per_episode > 0 and step_counters[i] >= max_steps_per_episode:
                         total_steps += int(step_counters[i])
@@ -451,6 +466,27 @@ def evaluate_vec(
         belief_auroc = float('nan')
         belief_ece = float('nan')
 
+    reveal_den = float(max(1, reveal_total))
+    forced_guess_rate = forced_guess_total / reveal_den
+    safe_option_rate = safe_option_total / reveal_den
+    safe_option_pick_rate = (
+        safe_option_hits / float(safe_option_total) if safe_option_total > 0 else float('nan')
+    )
+    safe_option_miss_rate = (
+        safe_option_misses / float(safe_option_total) if safe_option_total > 0 else float('nan')
+    )
+    avg_safe_options = (
+        safe_cells_accumulator / float(safe_option_total) if safe_option_total > 0 else float('nan')
+    )
+    avg_frontier_component_size = (
+        float(sum(component_sizes_all)) / len(component_sizes_all) if component_sizes_all else float('nan')
+    )
+    avg_selected_component_size = (
+        float(sum(chosen_component_sizes)) / len(chosen_component_sizes)
+        if chosen_component_sizes
+        else float('nan')
+    )
+
     result = {
         "win_rate": wins / max(1, episodes),
         "win_ci_low": ci_low,
@@ -458,9 +494,15 @@ def evaluate_vec(
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
-        "unavoidable_guess_rate": (unavoidable_total / float(max(1, reveal_total))),
-        "unavoidable_guess_success_rate": (unavoidable_success_total / float(unavoidable_total)) if unavoidable_total > 0 else float('nan'),
-        "unavoidable_episode_rate": (unavoidable_episode_total / float(max(1, episodes))),
+        "forced_guess_rate": forced_guess_rate,
+        "forced_guess_success_rate": (forced_guess_success_total / float(forced_guess_total)) if forced_guess_total > 0 else float('nan'),
+        "forced_guess_episode_rate": (forced_guess_episode_total / float(max(1, episodes))),
+        "safe_option_rate": safe_option_rate,
+        "safe_option_miss_rate": safe_option_miss_rate,
+        "safe_option_pick_rate": safe_option_pick_rate,
+        "avg_safe_options_per_turn": avg_safe_options,
+        "avg_frontier_component_size": avg_frontier_component_size,
+        "avg_selected_component_size": avg_selected_component_size,
         "belief_auroc": belief_auroc,
         "belief_ece": belief_ece,
         "wins": float(wins),
@@ -591,7 +633,17 @@ def main():
             ),
             (
                 "Guessing",
-                ["unavoidable_guess_rate", "unavoidable_guess_success_rate", "unavoidable_episode_rate"],
+                [
+                    "forced_guess_rate",
+                    "forced_guess_success_rate",
+                    "forced_guess_episode_rate",
+                    "safe_option_rate",
+                    "safe_option_miss_rate",
+                    "safe_option_pick_rate",
+                    "avg_safe_options_per_turn",
+                    "avg_frontier_component_size",
+                    "avg_selected_component_size",
+                ],
             ),
         ]
 
