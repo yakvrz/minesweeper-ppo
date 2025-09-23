@@ -10,13 +10,13 @@ env:
 model:
   name: cnn_residual
   stem_channels: 128
-  blocks: 8
+  blocks: 6
   dropout: 0.05
-  value_hidden: 192
+  value_hidden: 256
   tie_reveal_to_belief: false
 
 ppo:
-  num_envs: 128
+  num_envs: 256
   steps_per_env: 128
   mini_batches: 8
   ppo_epochs: 3
@@ -24,22 +24,23 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   vf_coef: 0.5
-  ent_coef: 0.002
+  ent_coef: 0.003
   ent_coef_min: 0.0010
-  ent_decay_updates: 300
+  ent_decay_updates: 400
   lr: 0.0003
   max_grad_norm: 0.5
-  aux_mine_weight: 0.00
-  aux_mine_calib_weight: 0.00
-  total_updates: 1000
+  aux_mine_weight: 0.05
+  aux_mine_calib_weight: 0.01
+  total_updates: 1200
 
 training:
-  beta_l2: 0.0002
+  beta_l2: 0.0
   early_stop_patience: 100
-  aux_mine_warmup_weight: 0.00
-  aux_mine_warmup_updates: 200
-  aux_mine_final_weight: 0.00
-  aux_mine_decay_power: 0.5
+  aux_mine_warmup_weight: 0.08
+  aux_mine_warmup_updates: 30
+  aux_mine_final_weight: 0.05
+  aux_mine_decay_power: 1.0
   rollout:
-    num_envs: 128
+    num_envs: 256
     steps_per_env: 128
+

@@ -13,7 +13,7 @@ model:
   blocks: 6
   dropout: 0.05
   value_hidden: 192
-  tie_reveal_to_belief: false
+  tie_reveal_to_belief: true
 
 ppo:
   num_envs: 128

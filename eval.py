@@ -549,6 +549,20 @@ def evaluate_vec(
     if train_mode:
         model.train()
 
+    # Compute Wilson score interval (95%) for win rate
+    def _wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+        if total <= 0:
+            return float('nan'), float('nan')
+        phat = successes / float(total)
+        denom = 1.0 + (z * z) / total
+        center = phat + (z * z) / (2.0 * total)
+        rad = z * np.sqrt((phat * (1.0 - phat) / total) + (z * z) / (4.0 * total * total))
+        low = (center - rad) / denom
+        high = (center + rad) / denom
+        return float(low), float(high)
+
+    ci_low, ci_high = _wilson_interval(wins, max(1, episodes))
+
     if belief_probs:
         probs_concat = np.concatenate(belief_probs)
         labels_concat = np.concatenate(belief_labels)
@@ -560,11 +574,15 @@ def evaluate_vec(
 
     result = {
         "win_rate": wins / max(1, episodes),
+        "win_ci_low": ci_low,
+        "win_ci_high": ci_high,
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
         "belief_auroc": belief_auroc,
         "belief_ece": belief_ece,
+        "wins": float(wins),
+        "episodes": float(episodes),
     }
     return result
 
@@ -698,7 +716,7 @@ def main():
             ("Model", ["checkpoint", "model"]),
             (
                 "Core Performance",
-                ["win_rate", "avg_steps", "avg_progress", "invalid_rate"],
+                ["win_rate", "win_ci_low", "win_ci_high", "avg_steps", "avg_progress", "invalid_rate"],
             ),
             (
                 "Belief Quality",
