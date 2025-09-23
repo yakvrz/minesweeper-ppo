@@ -6,12 +6,10 @@ import torch.nn as nn
 
 from .cnn import CNNPolicy
 from .cnn_residual import CNNResidualPolicy
-from .transformer import TransformerPolicy
 
 __all__ = [
     "CNNPolicy",
     "CNNResidualPolicy",
-    "TransformerPolicy",
     "build_model",
 ]
 
@@ -51,14 +49,5 @@ def build_model(
             value_hidden=value_hidden,
             tie_reveal_to_belief=tie_reveal,
         )
-
-    if name == "transformer":
-        H, W = obs_shape[1], obs_shape[2]
-        include_progress_channel = bool(env_overrides.get("include_progress_channel", False))
-        transformer_cfg = {
-            "include_progress_channel": include_progress_channel,
-        }
-        transformer_cfg.update(cfg)
-        return TransformerPolicy((H, W), **transformer_cfg)
 
     raise ValueError(f"Unknown model name: {name}")

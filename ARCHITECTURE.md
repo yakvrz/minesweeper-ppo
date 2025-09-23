@@ -9,7 +9,6 @@ Minesweeper RL prototype designed to run locally on a single NVIDIA RTX 4080. Th
 * Train an agent to play Minesweeper efficiently on standard boards (8×8×10; later 16×16×40, 16×30×99).
 * Keep the code minimal and fast: vectorized NumPy env on CPU, PyTorch model and PPO on GPU.
 * Provide clean module boundaries and typed APIs for quick iteration.
-* Enable an imitation-learning warm start from a rule-based solver.
 
 ## Non-Goals (for now)
 
@@ -28,7 +27,6 @@ minesweeper/
   models.py             # CNN policy/value/(optional) mine-prob heads
   buffers.py            # Rollout buffers (PPO), action masks
   ppo.py                # PPO algorithm (masked actions), GAE
-  train_il.py           # Imitation pretrain from rule solver dataset
   train_rl.py           # PPO training with curriculum + eval
   eval.py               # Eval loop, metrics, win-rate curves
   viz.py                # ASCII / minimal viewer + heatmaps
@@ -152,7 +150,7 @@ Rule-based solver exposes `forced_moves(state)` returning provably correct revea
 
 ## Model Architecture (PyTorch)
 
-We now ship two interchangeable backbones behind a common `build_model(...)` factory.
+Models are created via a shared `build_model(...)` factory that currently exposes two convolutional backbones.
 
 ### CNNPolicy (baseline)
 
@@ -161,25 +159,23 @@ We now ship two interchangeable backbones behind a common `build_model(...)` fac
 * Value head: GAP → MLP → scalar per batch.
 * Auxiliary mine head: 1×1 conv → `[B, 1, H, W]` for optional BCE supervision.
 
-Use this for the lightweight baseline or when experimenting on CPUs without attention acceleration.
+Use this for lightweight baselines or CPU-friendly experiments.
 
-### TransformerPolicy (token-per-cell)
+### CNNResidualPolicy (deeper residual stack)
 
-* Tokens: one per cell with features `[revealed, one-hot(0..8), optional progress scalar]`.
-* Positional encoding: learned row/column embeddings `E_row[r] + E_col[c]` plus optional 2-D relative bias (radius ≤ 4) inside attention.
-* Backbone: `L` pre-norm Transformer encoder blocks (`d_model=128`, `num_heads=8`, `mlp_ratio=2.0` by default).
-* Heads:
-  * Policy: MLP on token states → scalar per cell.
-  * Value: `[CLS]` token passed through LayerNorm + MLP → scalar.
-  * Mine prob: MLP on token states → `[B,1,H,W]` logits (used for BCE on unknown cells).
+* Stem: 3×3 conv to `stem_channels`, GroupNorm, ReLU.
+* Residual stack: `blocks` repeats of 3×3 conv + GroupNorm + ReLU + optional dropout.
+* Policy head: 1×1 conv stack → `[B, 1, H, W]` logits.
+* Value head: GAP → MLP (`value_hidden`) → scalar.
+* Optional mine-prob head and reveal/belief tying identical to the baseline variant.
 
-This ViT-style policy tends to learn better global reasoning on larger boards once shaped with the auxiliary mine loss.
+This is the default for larger boards; it scales width/depth through config values.
 
 ### Model Builder
 
-`minesweeper/models.py` exposes `build_model(name, obs_shape, env_overrides, model_cfg)` which instantiates either backbone. Architecture metadata is stored inside RL checkpoints so `eval.py` can rebuild the exact network automatically. For quicker experiments, see `configs/transformer_small.yaml` (≈0.35× FLOPs vs. the default).
+`minesweeper/models.py` exposes `build_model(name, obs_shape, env_overrides, model_cfg)` which instantiates one of the CNN variants. Architecture metadata is stored inside RL checkpoints so `eval.py` can rebuild the exact network automatically.
 
-Mixed precision and `torch.compile()` remain recommended for both variants on PyTorch ≥ 2.1.
+Mixed precision and `torch.compile()` remain recommended on PyTorch ≥ 2.1.
 
 ---
 
@@ -210,23 +206,11 @@ Mixed precision and `torch.compile()` remain recommended for both variants on Py
 
 ## Training Pipelines
 
-### Stage A — Imitation Learning (optional but recommended)
+### PPO
 
-* Generate dataset:
-
-  * Random boards; collect states where `forced_moves` exist.
-  * For each state, pick one action from the forced set at random.
-  * Store `(obs, action_mask, action, mine_mask)` if using auxiliary head.
-* Train:
-
-  * Loss = Cross-Entropy(policy) + `λ * BCE(mine_head)` (e.g., `λ = 0.1`).
-  * Train for a fixed number of steps/epochs (e.g., 1–3 epochs over \~1–5M samples).
-
-### Stage B — PPO Fine-Tune
-
-* Initialize from IL checkpoint (if used).
-* Turn on progress shaping, step penalty, terminal rewards.
-* Add curriculum: once eval win-rate > threshold on current board, include the next harder board in a mixture schedule.
+* Collect masked-action rollouts from `VecMinesweeper` (typically 256 envs × 128 steps).
+* Apply GAE, PPO clipping, value clipping, entropy bonus, and optional mine-head BCE in `ppo_update`.
+* Use curriculum or board-mixing as needed (e.g., advance when eval win-rate crosses a threshold).
 
 ---
 
@@ -339,9 +323,8 @@ training:
 
 1. **M0**: Env + ASCII viewer + random agent; sanity checks and unit tests on flood-fill and win/loss detection.
 2. **M1**: PPO with action masking on 8×8×10; show progression in avg revealed % and falling invalid rate.
-3. **M2**: Rule-based solver + imitation warm start; immediate bump in early win-rate.
-4. **M3**: Curriculum to 16×16×40 and density randomization; tune entropy/lr.
-5. **M4**: Optional mine-prob auxiliary head; visualize heatmaps and correlate with true mines.
+3. **M2**: Curriculum to 16×16×40 and density randomization; tune entropy/lr.
+4. **M3**: Optional mine-prob auxiliary head; visualize heatmaps and correlate with true mines.
 
 ---
 
@@ -357,10 +340,6 @@ training:
 ---
 
 ## Example Training Skeletons
-
-### Imitation
-
-Imitation training samples only forced-move states for CE/BCE; see `train_il.py`.
 
 ### PPO
 

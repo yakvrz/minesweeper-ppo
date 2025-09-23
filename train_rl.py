@@ -292,7 +292,7 @@ def collect_rollout(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="YAML config path")
-    parser.add_argument("--model", type=str, default=None, help="Model architecture override (cnn, transformer, ...)")
+    parser.add_argument("--model", type=str, default=None, help="Model architecture override (e.g., cnn, cnn_residual)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="runs/ppo")
     parser.add_argument("--updates", type=int, default=None)
@@ -305,7 +305,7 @@ def main() -> None:
     parser.add_argument("--quick_eval_interval", type=int, default=10, help="Run quick evaluation every N updates (0 disables)")
     parser.add_argument("--eval_pairs", type=int, default=1, help="Repeat final evaluation batches (averaged)")
     parser.add_argument("--skip_final_eval", action="store_true", help="Skip the post-training evaluation run")
-    parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing for transformer blocks")
+    parser.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing if the model supports it")
     parser.add_argument(
         "--flash_attention",
         choices=["auto", "on", "off"],

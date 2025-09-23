@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List
 import argparse
 import os
@@ -27,16 +26,7 @@ def _assert_action_space(mask: torch.Tensor, logits: torch.Tensor, env: Mineswee
     assert bool(mask.any().item()), "no valid actions available"
 
 
-@dataclass
-class ControllerState:
-    cooldown: torch.Tensor
-    last_action: Optional[int] = None
-    last_state_changed: bool = True
-
-
-def _init_controller_state(reveal_count: int, device: torch.device | None = None) -> ControllerState:
-    cooldown = torch.zeros(reveal_count, dtype=torch.int64, device=device or torch.device("cpu"))
-    return ControllerState(cooldown=cooldown)
+# Controller removed: no stateful heuristics
 
 
 def _forced_moves_full(env) -> list[tuple[str, int]]:
@@ -58,87 +48,7 @@ def _forced_moves_full(env) -> list[tuple[str, int]]:
     return moves
 
 
-def _controller_prepare_state(state: ControllerState, reveal_count: int) -> None:
-    device = state.cooldown.device if state.cooldown is not None else torch.device("cpu")
-    if state.cooldown.numel() != reveal_count:
-        state.cooldown = torch.zeros(reveal_count, dtype=torch.int64, device=device)
-    else:
-        if state.cooldown.numel() > 0:
-            state.cooldown = torch.clamp(state.cooldown - 1, min=0)
-
-
-def _masked_argmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    if mask.any():
-        scored = logits.masked_fill(~mask, float("-inf"))
-        idx = scored.argmax(dim=-1)
-        if mask[idx].item():
-            return idx
-    return logits.argmax(dim=-1)
-
-
-def _controller_select_action(
-    logits: torch.Tensor,
-    mask: torch.Tensor,
-    state: ControllerState,
-    mine_logits: Optional[torch.Tensor],
-    reveal_count: int,
-    cooldown_steps: int,
-) -> int:
-    _controller_prepare_state(state, reveal_count)
-    local_mask = mask.clone()
-    if state.cooldown.numel() == reveal_count:
-        flag_cool = state.cooldown > 0
-        if flag_cool.any():
-            local_mask[reveal_count:][flag_cool] = False
-
-    action = _masked_argmax(logits, local_mask)
-    if state.last_action is not None and action.item() == state.last_action and not state.last_state_changed:
-        local_mask[action] = False
-        if local_mask.any():
-            action = _masked_argmax(logits, local_mask)
-
-    if not state.last_state_changed and local_mask[:reveal_count].any():
-        if mine_logits is not None:
-            probs = torch.sigmoid(mine_logits.flatten())
-            masked_probs = probs.masked_fill(~local_mask[:reveal_count], float("inf"))
-            alt = torch.argmin(masked_probs)
-            if torch.isfinite(masked_probs[alt]):
-                action = alt
-        else:
-            reveal_choice = _masked_argmax(logits[:reveal_count], local_mask[:reveal_count])
-            action = reveal_choice
-
-    if action.item() < reveal_count and mine_logits is not None:
-        reveal_mask = local_mask[:reveal_count]
-        if reveal_mask.any():
-            probs = torch.sigmoid(mine_logits.flatten())
-            masked_probs = probs.masked_fill(~reveal_mask, float("inf"))
-            alt = torch.argmin(masked_probs)
-            if torch.isfinite(masked_probs[alt]):
-                action = alt
-
-    if not local_mask[action].item():
-        # fallback to original mask
-        action = _masked_argmax(logits, mask)
-    return int(action.item())
-
-
-def _controller_update_state(
-    state: ControllerState,
-    action: int,
-    reveal_count: int,
-    new_reveals: int,
-    toggles: int,
-    cooldown_steps: int,
-) -> None:
-    if state.cooldown.numel() != reveal_count:
-        state.cooldown = torch.zeros(reveal_count, dtype=torch.int64, device=state.cooldown.device)
-    state.last_action = action
-    state.last_state_changed = bool(new_reveals > 0 or toggles > 0)
-    if action >= reveal_count:
-        cell = action - reveal_count
-        if 0 <= cell < reveal_count:
-            state.cooldown[cell] = cooldown_steps + 1
+# Controller helpers removed
 
 def _compute_auroc(labels: np.ndarray, scores: np.ndarray) -> float:
     labels = labels.reshape(-1)
@@ -184,15 +94,12 @@ def debug_eval(
     env_cfg: EnvConfig,
     reveal_only: bool = False,
     max_steps: int = 512,
-    use_controller: bool = False,
-    controller_cooldown: int = 2,
 ) -> None:
     device = next(model.parameters()).device
     env = MinesweeperEnv(env_cfg, seed=0)
     data = env.reset()
     H, W = env.H, env.W
     reveal_count = H * W
-    state = _init_controller_state(reveal_count)
     print("[debug] starting single-episode probe", flush=True)
     for step in range(max_steps):
         obs = torch.from_numpy(data["obs"][None]).to(device=device, dtype=torch.float32)
@@ -203,22 +110,13 @@ def debug_eval(
         if not mask.any():
             mask = torch.ones_like(mask)
 
-        if use_controller:
-            logits, _, mine_logits = model(obs, return_mine=True)
-        else:
-            logits, _ = model(obs)
-            mine_logits = None
+        logits, _ = model(obs)
+        mine_logits = None
         _assert_action_space(mask, logits, env)
 
         mask_flat = mask[0].view(-1).cpu()
-        if use_controller:
-            mine_slice = mine_logits[0, 0] if mine_logits is not None else None
-            action = _controller_select_action(
-                logits[0], mask[0], state, mine_slice, reveal_count, controller_cooldown
-            )
-        else:
-            masked_logits = logits.masked_fill(~mask, -1e9)
-            action = int(masked_logits.argmax(dim=-1).item())
+        masked_logits = logits.masked_fill(~mask, -1e9)
+        action = int(masked_logits.argmax(dim=-1).item())
 
         valid_reveals = int(mask_flat[:reveal_count].sum().item())
         valid_flags = int(mask_flat[reveal_count:].sum().item())
@@ -250,18 +148,7 @@ def debug_eval(
         new_reveals = int(env.revealed.sum()) - prev_reveals
         toggles = int(np.logical_xor(prev_flags, env.flags).sum())
 
-        if use_controller:
-            _controller_update_state(
-                state,
-                action,
-                reveal_count,
-                new_reveals,
-                toggles,
-                controller_cooldown,
-            )
-        else:
-            state.last_action = action
-            state.last_state_changed = bool(new_reveals > 0 or toggles > 0)
+        # controller removed
 
         print(
             json.dumps(
@@ -385,8 +272,6 @@ def evaluate_vec(
     reveal_only: bool = False,
     max_steps_per_episode: int = 512,
     reveal_fallback_every: int = 0,
-    use_controller: bool = False,
-    controller_cooldown: int = 2,
 ) -> Dict[str, float]:
     device = next(model.parameters()).device
     train_mode = model.training
@@ -395,9 +280,7 @@ def evaluate_vec(
     batch = vec.reset()
 
     reveal_count = env_cfg.H * env_cfg.W
-    controller_states: List[ControllerState] = []
-    if use_controller:
-        controller_states = [_init_controller_state(reveal_count) for _ in range(num_envs)]
+    # controller removed
 
     remaining = episodes
     processed = 0
@@ -405,6 +288,11 @@ def evaluate_vec(
     total_steps = 0
     total_progress = 0.0
     invalids = 0
+    # Guessing metrics
+    reveal_total = 0
+    unavoidable_total = 0
+    unavoidable_success_total = 0
+    unavoidable_episode_total = 0
     total_guess_attempts = 0
     total_guess_success = 0
     belief_probs: list[np.ndarray] = []
@@ -426,6 +314,7 @@ def evaluate_vec(
             finished = 0
             counted = np.zeros((num_envs,), dtype=bool)
             step_counters = np.zeros((num_envs,), dtype=np.int32)
+            ep_unavoidable = np.zeros((num_envs,), dtype=bool)
             tick = 0
             last_reported_finished = 0
             while finished < batch_size:
@@ -441,17 +330,7 @@ def evaluate_vec(
                 _assert_action_space(mask, logits, vec.envs[0])
 
                 masked_logits = logits.masked_fill(~mask, -1e9)
-                if use_controller:
-                    actions_out: list[int] = []
-                    for i in range(mask.shape[0]):
-                        mine_slice = mine_logits[i, 0] if mine_logits is not None else None
-                        action = _controller_select_action(
-                            logits[i], mask[i], controller_states[i], mine_slice, reveal_count, controller_cooldown
-                        )
-                        actions_out.append(int(action))
-                    actions = np.asarray(actions_out, dtype=np.int32)
-                else:
-                    actions = masked_logits.argmax(dim=-1).cpu().numpy().astype(np.int32)
+                actions = masked_logits.argmax(dim=-1).cpu().numpy().astype(np.int32)
 
                 mask_flat = mask.view(mask.shape[0], -1)
                 picked_mask = mask_flat[torch.arange(mask.shape[0]), torch.from_numpy(actions)]
@@ -494,6 +373,15 @@ def evaluate_vec(
                     if cell_idx in module_sets.get("subset_reveal", set()):
                         module_hits_vec["subset_reveal"] += 1
 
+                    # Unavoidable guess accounting (no forced reveals available)
+                    # All actions are reveals in this setup, so count per action.
+                    reveal_total += 1
+                    if len(forced_reveals) == 0:
+                        unavoidable_total += 1
+                        ep_unavoidable[idx] = True
+                        if not env.mine_mask[row, col]:
+                            unavoidable_success_total += 1
+
                 batch, rewards_np, dones_np, infos = vec.step(actions)
                 rewards = torch.from_numpy(rewards_np).to(device=device, dtype=torch.float32)
                 dones = torch.from_numpy(dones_np).to(device=device, dtype=torch.bool)
@@ -507,15 +395,6 @@ def evaluate_vec(
                     toggles = int(aux.get("toggles", 0))
                     if not counted[i]:
                         total_progress += new_reveals / float(env_cfg.H * env_cfg.W)
-                        if use_controller:
-                            _controller_update_state(
-                                controller_states[i],
-                                int(actions[i]),
-                                reveal_count,
-                                new_reveals,
-                                toggles,
-                                controller_cooldown,
-                            )
                     if not counted[i] and dones[i]:
                         outcome = outcomes[i]
                         if outcome == "win":
@@ -524,15 +403,15 @@ def evaluate_vec(
                         step_counters[i] = 0
                         counted[i] = True
                         finished += 1
-                        if use_controller:
-                            controller_states[i] = _init_controller_state(reveal_count)
+                        if ep_unavoidable[i]:
+                            unavoidable_episode_total += 1
+                        # controller removed
                     if not counted[i] and max_steps_per_episode > 0 and step_counters[i] >= max_steps_per_episode:
                         total_steps += int(step_counters[i])
                         step_counters[i] = 0
                         counted[i] = True
                         finished += 1
-                        if use_controller:
-                            controller_states[i] = _init_controller_state(reveal_count)
+                        # controller removed
                 tick += 1
                 if progress_every:
                     if (finished - last_reported_finished) >= min(progress_every, batch_size):
@@ -579,6 +458,9 @@ def evaluate_vec(
         "avg_steps": total_steps / max(1, episodes),
         "avg_progress": total_progress / max(1, episodes),
         "invalid_rate": invalids / max(1, total_steps),
+        "unavoidable_guess_rate": (unavoidable_total / float(max(1, reveal_total))),
+        "unavoidable_guess_success_rate": (unavoidable_success_total / float(unavoidable_total)) if unavoidable_total > 0 else float('nan'),
+        "unavoidable_episode_rate": (unavoidable_episode_total / float(max(1, episodes))),
         "belief_auroc": belief_auroc,
         "belief_ece": belief_ece,
         "wins": float(wins),
@@ -610,13 +492,7 @@ def main():
     parser.add_argument("--progress", action="store_true", help="Print evaluation progress")
     parser.add_argument("--reveal_only", action="store_true", help="Restrict eval actions to reveals only")
     parser.add_argument("--debug_eval", action="store_true", help="Run single-episode debug probe")
-    parser.add_argument("--controller", action="store_true", help="Enable inference controller heuristics")
-    parser.add_argument(
-        "--controller_cooldown",
-        type=int,
-        default=2,
-        help="Cooldown steps before the same flag can be reconsidered by the controller",
-    )
+    # controller removed
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -685,8 +561,6 @@ def main():
             model,
             env_cfg,
             reveal_only=args.reveal_only,
-            use_controller=args.controller,
-            controller_cooldown=args.controller_cooldown,
         )
         return
 
@@ -699,8 +573,6 @@ def main():
         num_envs=min(args.num_envs, args.episodes),
         progress_every=(max(1, args.episodes // 4) if args.progress else 0),
         reveal_only=args.reveal_only,
-        use_controller=args.controller,
-        controller_cooldown=args.controller_cooldown,
     )
 
     summary = {"checkpoint": os.path.basename(ckpt_path), "model": model_name, **metrics}
@@ -721,6 +593,10 @@ def main():
             (
                 "Belief Quality",
                 ["belief_auroc", "belief_ece"],
+            ),
+            (
+                "Guessing",
+                ["unavoidable_guess_rate", "unavoidable_guess_success_rate", "unavoidable_episode_rate"],
             ),
         ]
 

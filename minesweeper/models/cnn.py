@@ -58,7 +58,7 @@ class CNNPolicy(nn.Module):
         self._last_beta_reg: Optional[torch.Tensor] = None
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:  # pragma: no cover
-        # Included for API parity with transformer models.
+        # Placeholder for API compatibility; no gradient checkpointing is used here.
         return None
 
     def forward(self, x: torch.Tensor, return_mine: bool = False):
