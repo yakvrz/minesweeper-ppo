@@ -90,7 +90,8 @@ class CNNResidualPolicy(nn.Module):
 
         value = self.value_head(f).squeeze(-1)
         if return_mine:
-            mine_logits_map = self.mine_head(f)
+            # Detach to keep auxiliary belief gradients separate from the policy trunk.
+            mine_logits_map = self.mine_head(f.detach())
             return policy_logits_flat, value, mine_logits_map
         return policy_logits_flat, value
 

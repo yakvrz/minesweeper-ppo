@@ -33,10 +33,6 @@ ppo:
 training:
   beta_l2: 0.0
   early_stop_patience: 100
-  aux_mine_warmup_weight: 0.08
-  aux_mine_warmup_updates: 30
-  aux_mine_final_weight: 0.05
-  aux_mine_decay_power: 1.0
   rollout:
     num_envs: 192
     steps_per_env: 64
