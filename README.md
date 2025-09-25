@@ -1,4 +1,4 @@
-# minesweeper-rl
+# Minesweeper PPO Agent
 
 End-to-end reinforcement learning project that trains a CNN policy/value network to play 16×16 Minesweeper with 40 mines. The repo packages the training code, evaluation utilities, and a browser-based inspector that reveals what the model believes and which move it would take next.
 
