@@ -48,6 +48,3 @@ The script manages PPO rollouts, periodic evaluation, and checkpointing. See `AR
 - `scripts/` – helper scripts and smoke tests
 - `docs/` – supplementary notes (e.g., architecture overview)
 - `runs/` – sample checkpoints and metrics (you can remove or replace with your own)
-
-## License
-MIT (see `LICENSE`).
