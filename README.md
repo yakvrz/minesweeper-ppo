@@ -10,6 +10,16 @@ Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
 - PPO training (CNN): `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
 - Evaluate latest checkpoint: `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
 
+### Interactive Web UI
+
+You can visualize a trained checkpoint inside an interactive Minesweeper board with the model’s safety probabilities overlaid on each unrevealed cell:
+
+- Install deps (including FastAPI): `pip install -r requirements.txt`
+- Point the app at a checkpoint (defaults to `runs/baseline_quick20_u200/ckpt_best.pt`): `export MINESWEEPER_CKPT=/path/to/ckpt.pt`
+- Launch the web server: `uvicorn webui.app:app --reload`
+- Open http://127.0.0.1:8000 in your browser and start revealing tiles. Toggle the overlay to show/hide the semi-transparent probability shading; when enabled, the color + percentage on each hidden cell reflect the model’s belief that the tile is safe (`100%` = safest).
+- Optional smoke test for the API layer: `PYTHONPATH=. python scripts/test_webui.py`
+
 ## Reveal-only training (tiny example)
 
 - Tiny PPO: `python train_rl.py --config configs/tiny_6x6_6.yaml --out runs/tiny_reveal --updates 200`

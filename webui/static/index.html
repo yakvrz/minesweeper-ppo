@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Minesweeper RL WebUI</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="top-bar">
+      <h1>Minesweeper RL</h1>
+      <div class="controls">
+        <button id="new-game" type="button">New Game</button>
+        <button id="toggle-overlay" type="button">Hide Overlay</button>
+        <span id="status" class="status">Ready</span>
+      </div>
+    </header>
+    <section class="board-wrapper">
+      <div id="board" class="board" role="grid" aria-label="Minesweeper board"></div>
+    </section>
+    <section class="legend">
+      <h2>Legend</h2>
+      <p>Colors indicate predicted safety (green is safer, red is riskier). Percentages show the model&apos;s belief that a tile is safe.</p>
+    </section>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
