@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,10 +11,20 @@ from minesweeper.env import EnvConfig, MinesweeperEnv
 from minesweeper.models import build_model
 
 
+BOARD_PRESETS: Dict[str, Dict[str, Any]] = {
+    "8x8": {"rows": 8, "cols": 8, "mines": 10, "label": "8×8 · 10 mines"},
+    "16x16": {"rows": 16, "cols": 16, "mines": 40, "label": "16×16 · 40 mines"},
+}
+
+
 @dataclass
 class BoardState:
     rows: int
     cols: int
+    mine_count: int
+    preset: str
+    preset_label: str
+    preset_options: List[Dict[str, str]]
     revealed: List[List[bool]]
     counts: List[List[int]]
     safe_probabilities: List[List[Optional[float]]]
@@ -43,6 +53,8 @@ class MinesweeperSession:
         self.env = self._init_env()
         self.model = self._load_model().to(self.device)
         self.model.eval()
+
+        self._current_preset = self._match_preset(self.env_cfg)
 
         self._last_obs: Dict[str, Any] = self.env.reset()
         self._last_done = False
@@ -81,6 +93,20 @@ class MinesweeperSession:
         self._last_done = False
         self._last_outcome = None
         return self._build_state()
+
+    def set_board_preset(self, preset: str, seed: Optional[int] = None) -> BoardState:
+        preset_key = preset.lower()
+        if preset_key not in BOARD_PRESETS:
+            raise ValueError(f"Unknown board preset: {preset}")
+        preset_cfg = BOARD_PRESETS[preset_key]
+        self.env_cfg = replace(
+            self.env_cfg,
+            H=int(preset_cfg["rows"]),
+            W=int(preset_cfg["cols"]),
+            mine_count=int(preset_cfg["mines"]),
+        )
+        self._current_preset = preset_key
+        return self.reset(seed=seed)
 
     def click(self, row: int, col: int) -> BoardState:
         if not (0 <= row < self.env.H and 0 <= col < self.env.W):
@@ -124,9 +150,17 @@ class MinesweeperSession:
                 row_vals.append(sp)
             safe_prob_serializable.append(row_vals)
 
+        preset_key = self._current_preset
+        preset_label = self._preset_label(preset_key)
+        preset_options = self._preset_options()
+
         return BoardState(
             rows=self.env.H,
             cols=self.env.W,
+            mine_count=int(self.env.cfg.mine_count),
+            preset=preset_key,
+            preset_label=preset_label,
+            preset_options=preset_options,
             revealed=revealed.astype(bool).tolist(),
             counts=counts.astype(int).tolist(),
             safe_probabilities=safe_prob_serializable,
@@ -134,3 +168,30 @@ class MinesweeperSession:
             outcome=self._last_outcome,
             step=int(self.env.step_count),
         )
+
+    def _preset_label(self, preset: str) -> str:
+        if preset in BOARD_PRESETS:
+            return BOARD_PRESETS[preset]["label"]
+        return f"{self.env_cfg.H}×{self.env_cfg.W} · {self.env_cfg.mine_count} mines"
+
+    def _preset_options(self) -> List[Dict[str, str]]:
+        options = [
+            {"id": key, "label": cfg["label"]}
+            for key, cfg in BOARD_PRESETS.items()
+        ]
+        if self._current_preset not in BOARD_PRESETS:
+            options.append({
+                "id": self._current_preset,
+                "label": self._preset_label(self._current_preset),
+            })
+        return options
+
+    def _match_preset(self, cfg: EnvConfig) -> str:
+        for key, preset in BOARD_PRESETS.items():
+            if (
+                int(preset["rows"]) == int(cfg.H)
+                and int(preset["cols"]) == int(cfg.W)
+                and int(preset["mines"]) == int(cfg.mine_count)
+            ):
+                return key
+        return "custom"

@@ -11,16 +11,28 @@
       <h1>Minesweeper RL</h1>
       <div class="controls">
         <button id="new-game" type="button">New Game</button>
-        <button id="toggle-overlay" type="button">Hide Overlay</button>
+        <label class="board-select-wrapper">
+          <span class="sr-only">Board preset</span>
+          <select id="board-select" class="board-select" aria-label="Board preset"></select>
+        </label>
+        <button id="toggle-overlay" type="button" class="secondary">Hide Mine Probabilities</button>
         <span id="status" class="status">Ready</span>
       </div>
     </header>
     <section class="board-wrapper">
       <div id="board" class="board" role="grid" aria-label="Minesweeper board"></div>
+      <div id="game-over" class="game-over" role="alert" aria-live="assertive">
+        <div class="game-over__panel">
+          <div id="game-over-message" class="game-over__message"></div>
+          <div class="game-over__actions">
+            <button id="game-over-reset" type="button">Play Again</button>
+          </div>
+        </div>
+      </div>
     </section>
     <section class="legend">
       <h2>Legend</h2>
-      <p>Colors indicate predicted safety (green is safer, red is riskier). Percentages show the model&apos;s belief that a tile is safe.</p>
+      <p>Red shading grows stronger as a cell becomes more likely to hide a mine (100% = certain mine). The percentage shows the model&apos;s mine probability estimate.</p>
     </section>
   </div>
   <script type="module" src="/static/app.js"></script>

@@ -20,6 +20,7 @@ class ClickRequest(BaseModel):
 
 class NewGameRequest(BaseModel):
     seed: Optional[int] = None
+    preset: Optional[str] = None
 
 
 def _default_checkpoint() -> Path:
@@ -65,7 +66,14 @@ def get_state() -> dict:
 
 @app.post("/api/new-game")
 def new_game(req: NewGameRequest) -> dict:
-    state = _get_session().reset(seed=req.seed)
+    session = _get_session()
+    if req.preset:
+        try:
+            state = session.set_board_preset(req.preset, seed=req.seed)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        state = session.reset(seed=req.seed)
     return asdict(state)
 
 

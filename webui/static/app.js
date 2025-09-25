@@ -2,13 +2,18 @@ const boardEl = document.getElementById('board');
 const statusEl = document.getElementById('status');
 const newGameBtn = document.getElementById('new-game');
 const toggleOverlayBtn = document.getElementById('toggle-overlay');
+const boardSelect = document.getElementById('board-select');
+const gameOverEl = document.getElementById('game-over');
+const gameOverMessageEl = document.getElementById('game-over-message');
+const gameOverResetBtn = document.getElementById('game-over-reset');
 
 let currentState = null;
 let isBusy = false;
 let overlayEnabled = true;
+let presetCacheSignature = '';
 
 const updateOverlayControl = () => {
-  toggleOverlayBtn.textContent = overlayEnabled ? 'Hide Overlay' : 'Show Overlay';
+  toggleOverlayBtn.textContent = overlayEnabled ? 'Hide Mine Probabilities' : 'Show Mine Probabilities';
   toggleOverlayBtn.setAttribute('aria-pressed', overlayEnabled ? 'true' : 'false');
 };
 
@@ -19,13 +24,49 @@ const formatPercent = (value) => {
   return `${Math.round(value * 100)}%`;
 };
 
-const probToColor = (value) => {
-  if (value === null || Number.isNaN(value)) {
-    return 'transparent';
+const mineColor = (prob) => {
+  const mine = Math.min(Math.max(prob, 0), 1);
+  const alpha = mine * 0.85;
+  return `rgba(239, 68, 68, ${alpha})`;
+};
+
+const applyMineProbabilityDecor = (cell, overlayEl, labelEl, safeProb, row, col) => {
+  const rowIdx = row + 1;
+  const colIdx = col + 1;
+  const hasProb = safeProb !== null && !Number.isNaN(safeProb);
+  if (!hasProb) {
+    cell.classList.remove('show-overlay');
+    overlayEl.style.backgroundColor = 'transparent';
+    overlayEl.style.opacity = 0;
+    labelEl.textContent = '';
+    labelEl.setAttribute('aria-hidden', 'true');
+    cell.removeAttribute('data-mine-percent');
+    cell.setAttribute('title', `Cell ${rowIdx}-${colIdx}: mine probability unavailable`);
+    cell.setAttribute('aria-label', `Cell ${rowIdx}, ${colIdx}: mine probability unavailable`);
+    cell.style.removeProperty('--cell-border');
+    return;
   }
-  const safe = Math.min(Math.max(value, 0), 1);
-  const hue = safe * 120; // 0 -> red, 120 -> green
-  return `hsla(${hue}, 70%, 50%, 0.65)`;
+
+  const mineProb = 1 - safeProb;
+  const clamped = Math.min(Math.max(mineProb, 0), 1);
+  const percent = Math.round(clamped * 100);
+  overlayEl.style.backgroundColor = mineColor(clamped);
+  const overlayActive = overlayEnabled && clamped > 0;
+  const overlayStrength = overlayActive ? Math.min(1, clamped + 0.05) : 0;
+  overlayEl.style.opacity = overlayStrength;
+  labelEl.textContent = overlayActive ? `${percent}%` : '';
+  labelEl.setAttribute('aria-hidden', overlayActive ? 'false' : 'true');
+  cell.dataset.minePercent = String(percent);
+  cell.setAttribute('title', `Cell ${rowIdx}-${colIdx}: mine probability ${percent}%`);
+  cell.setAttribute('aria-label', `Cell ${rowIdx}, ${colIdx}: mine probability ${percent} percent`);
+
+  if (overlayActive) {
+    cell.classList.add('show-overlay');
+    cell.style.setProperty('--cell-border', `rgba(239, 68, 68, ${clamped * 0.6})`);
+  } else {
+    cell.classList.remove('show-overlay');
+    cell.style.removeProperty('--cell-border');
+  }
 };
 
 const updateStatus = (state, message = null) => {
@@ -50,8 +91,36 @@ const updateStatus = (state, message = null) => {
   }
 };
 
+const formatOutcomeMessage = (state) => {
+  if (!state || !state.done) {
+    return '';
+  }
+  if (state.outcome === 'win') {
+    return `🎉 Victory! Cleared the board in ${state.step} steps.`;
+  }
+  if (state.outcome === 'loss') {
+    return `💥 Boom! A mine ended the run on step ${state.step}.`;
+  }
+  return `Game finished in ${state.step} steps.`;
+};
+
+const hideGameOver = () => {
+  gameOverEl.classList.remove('visible');
+  gameOverMessageEl.textContent = '';
+};
+
+const updateGameOver = (state) => {
+  if (!state || !state.done) {
+    hideGameOver();
+    return;
+  }
+  gameOverMessageEl.textContent = formatOutcomeMessage(state);
+  gameOverEl.classList.add('visible');
+};
+
 const renderBoard = (state) => {
   boardEl.classList.toggle('overlay-enabled', overlayEnabled);
+  boardEl.classList.toggle('is-complete', Boolean(state.done));
   boardEl.style.setProperty('--rows', state.rows);
   boardEl.style.setProperty('--cols', state.cols);
   boardEl.innerHTML = '';
@@ -68,27 +137,36 @@ const renderBoard = (state) => {
       cell.dataset.col = String(c);
       cell.classList.add('cell');
 
+      const face = document.createElement('span');
+      face.classList.add('cell-face');
+      cell.appendChild(face);
+
       if (revealed) {
         cell.classList.add('revealed');
         if (count > 0) {
-          cell.textContent = String(count);
+          face.textContent = String(count);
           cell.classList.add(`count-${count}`);
         } else {
-          cell.innerHTML = '&nbsp;';
+          face.innerHTML = '&nbsp;';
         }
         cell.disabled = true;
+        cell.removeAttribute('title');
       } else {
         cell.classList.add('hidden');
-        cell.style.setProperty('--overlay-color', probToColor(prob));
-        if (prob !== null) {
-          cell.setAttribute('aria-label', `Cell (${r}, ${c}) safe probability ${Math.round(prob * 100)} percent`);
-        }
-        if (overlayEnabled && prob !== null) {
-          const label = document.createElement('span');
-          label.classList.add('prob-label');
-          label.textContent = formatPercent(prob);
-          cell.appendChild(label);
-        }
+        face.innerHTML = '&nbsp;';
+
+        const overlay = document.createElement('span');
+        overlay.classList.add('mine-overlay');
+        overlay.setAttribute('aria-hidden', 'true');
+        cell.appendChild(overlay);
+
+        const label = document.createElement('span');
+        label.classList.add('mine-label');
+        label.setAttribute('aria-hidden', overlayEnabled ? 'false' : 'true');
+        cell.appendChild(label);
+
+        applyMineProbabilityDecor(cell, overlay, label, prob, r, c);
+
         if (state.done) {
           cell.disabled = true;
         } else {
@@ -128,6 +206,8 @@ const refresh = (state) => {
   currentState = state;
   renderBoard(state);
   updateStatus(state);
+  updateGameOver(state);
+  syncBoardOptions(state);
 };
 
 const onCellClick = async (event) => {
@@ -150,14 +230,22 @@ const onCellClick = async (event) => {
   }
 };
 
-const startNewGame = async () => {
+const startNewGame = async ({ preset = null, seed = null } = {}) => {
   if (isBusy) {
     return;
   }
   isBusy = true;
-  updateStatus(null, 'Resetting…');
+  updateStatus(null, preset ? 'Loading board…' : 'Resetting…');
+  hideGameOver();
   try {
-    const nextState = await postJson('/api/new-game', {});
+    const payload = {};
+    if (preset) {
+      payload.preset = preset;
+    }
+    if (seed !== null && seed !== undefined) {
+      payload.seed = seed;
+    }
+    const nextState = await postJson('/api/new-game', payload);
     refresh(nextState);
   } catch (err) {
     console.error(err);
@@ -167,7 +255,7 @@ const startNewGame = async () => {
   }
 };
 
-newGameBtn.addEventListener('click', startNewGame);
+newGameBtn.addEventListener('click', () => startNewGame());
 toggleOverlayBtn.addEventListener('click', () => {
   overlayEnabled = !overlayEnabled;
   updateOverlayControl();
@@ -188,4 +276,48 @@ const bootstrap = async () => {
   }
 };
 
+gameOverResetBtn.addEventListener('click', () => startNewGame());
+
 bootstrap();
+
+function syncBoardOptions(state) {
+  if (!boardSelect || !state || !Array.isArray(state.preset_options)) {
+    return;
+  }
+
+  const signature = state.preset_options
+    .map((opt) => `${opt.id}:${opt.label}`)
+    .join('|');
+
+  if (signature !== presetCacheSignature) {
+    presetCacheSignature = signature;
+    boardSelect.innerHTML = '';
+    state.preset_options.forEach((opt) => {
+      const optionEl = document.createElement('option');
+      optionEl.value = opt.id;
+      optionEl.textContent = opt.label;
+      boardSelect.appendChild(optionEl);
+    });
+  }
+
+  const hasCurrentOption = state.preset_options.some((opt) => opt.id === state.preset);
+  if (!hasCurrentOption && state.preset) {
+    const optionEl = document.createElement('option');
+    optionEl.value = state.preset;
+    optionEl.textContent = state.preset_label || state.preset;
+    boardSelect.appendChild(optionEl);
+  }
+
+  if (state.preset) {
+    boardSelect.value = state.preset;
+  }
+  boardSelect.title = state.preset_label || '';
+}
+
+boardSelect?.addEventListener('change', (event) => {
+  const nextPreset = event.target.value;
+  if (!nextPreset || (currentState && currentState.preset === nextPreset)) {
+    return;
+  }
+  startNewGame({ preset: nextPreset });
+});

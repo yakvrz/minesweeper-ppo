@@ -17,7 +17,8 @@ You can visualize a trained checkpoint inside an interactive Minesweeper board w
 - Install deps (including FastAPI): `pip install -r requirements.txt`
 - Point the app at a checkpoint (defaults to `runs/baseline_quick20_u200/ckpt_best.pt`): `export MINESWEEPER_CKPT=/path/to/ckpt.pt`
 - Launch the web server: `uvicorn webui.app:app --reload`
-- Open http://127.0.0.1:8000 in your browser and start revealing tiles. Toggle the overlay to show/hide the semi-transparent probability shading; when enabled, the color + percentage on each hidden cell reflect the model’s belief that the tile is safe (`100%` = safest).
+- Open http://127.0.0.1:8000 in your browser and start revealing tiles. Toggle the overlay to show or hide the mine-heatmap; deeper red means higher mine probability (`100%` = certain mine).
+- Use the board preset dropdown in the header to switch between the default 8×8×10 layout and a 16×16×40 board (the same checkpoint powers both via its convolutional trunk).
 - Optional smoke test for the API layer: `PYTHONPATH=. python scripts/test_webui.py`
 
 ## Reveal-only training (tiny example)

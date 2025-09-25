@@ -27,6 +27,15 @@ def run_smoke() -> None:
         assert reset_state["step"] == 0
         assert reset_state["done"] is False
 
+        resized_state = client.post("/api/new-game", json={"preset": "16x16"}).json()
+        assert resized_state["rows"] == 16
+        assert resized_state["cols"] == 16
+        assert resized_state["mine_count"] == 40
+
+        reverted_state = client.post("/api/new-game", json={"preset": "8x8"}).json()
+        assert reverted_state["rows"] == 8
+        assert reverted_state["cols"] == 8
+
 
 if __name__ == "__main__":
     run_smoke()
