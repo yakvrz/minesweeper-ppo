@@ -2,28 +2,15 @@
 
 End-to-end reinforcement learning project that trains a CNN policy/value network to play 16×16 Minesweeper with 40 mines. The repo packages the training code, evaluation utilities, and a browser-based inspector that reveals what the model believes and which move it would take next.
 
-## At a Glance
-- **Board:** 16×16 with 40 hidden mines (classic Intermediate difficulty).
-- **Model:** Residual CNN policy/value network with an auxiliary mine-probability head.
-- **Training:** PPO on ~4M environment steps (16×16×40 curriculum, medium configuration).
-- **Evaluation (256 episodes):**
-  - Win rate: **84.0 %** (CI ≈ 0.79–0.88)
-  - Average steps to terminal: **54.1**
-  - Belief AUC: **0.93**
-  - Belief ECE: **0.073**
-
-## Model Card
-| Field | Value |
-| --- | --- |
-| **Architecture** | Residual CNN (stem 128 ch, 6 blocks) with separate mine-probability head for diagnostics |
-| **Checkpoint** | `runs/scaling16_medium_u4000/ckpt_final.pt` |
-| **Observation** | 10-channel tensor (revealed mask + one-hot counts) |
-| **Action space** | Reveal cell only (256 logits) |
-| **Training** | PPO (γ=0.995, λ=0.95, 192 envs × 64 steps, 4000 updates); no supervised labels are used for the policy |
-| **Reward** | +1 / −1 terminal, −1e-4 per move |
-| **Evaluation metrics** | Win 84 %, AUROC 0.93, ECE 0.073 |
-| **Limitations** | Mine-probability head is for interpretability only; calibrated on 16×16×40 frontier states |
-
+## Overview
+- **Board:** 16×16 grid with 40 mines (Intermediate).
+- **Policy:** Residual CNN trained with PPO; no supervised labels were used.
+- **Belief head:** Separate mine-probability head for telemetry and UI overlays.
+- **Evaluation (2048 episodes):**
+  - Win rate: **87.2%** (95% CI: 0.857–0.886)
+  - Mean steps per game: **41.8**
+  - Mine AUROC: **0.946**
+  - Mine ECE: **0.065**
 ## Web UI
 Launch the dashboard to inspect a checkpoint and play interactively:
 ```bash
