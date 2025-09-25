@@ -1,0 +1,8 @@
+env:
+  H: 16
+  W: 16
+  mine_count: 40
+  guarantee_safe_neighborhood: true
+  step_penalty: 0.0001
+
+# This config is intended for eval.py; tuning parameters live in configs/training/.

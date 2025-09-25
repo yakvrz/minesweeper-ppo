@@ -41,7 +41,7 @@ Open http://127.0.0.1:8000 and:
 ```bash
 PYTHONPATH=. python eval.py \
   --ckpt runs/scaling16_medium_u4000/ckpt_final.pt \
-  --config configs/scaling/cnn_residual_16x16x40_medium.yaml \
+  --config configs/eval/16x16x40_medium.yaml \
   --episodes 256 --num_envs 64 --progress
 ```
 Outputs win rate, calibration metrics, and guessing statistics.
@@ -49,7 +49,7 @@ Outputs win rate, calibration metrics, and guessing statistics.
 ## Training
 ```bash
 python train_rl.py \
-  --config configs/scaling/cnn_residual_16x16x40_medium.yaml \
+  --config configs/training/16x16x40_medium.yaml \
   --out runs/experiment_name
 ```
 The script manages PPO rollouts, periodic evaluation, and checkpointing. See `ARCHITECTURE.md` for a full breakdown of the environment and training pipeline.
@@ -57,7 +57,7 @@ The script manages PPO rollouts, periodic evaluation, and checkpointing. See `AR
 ## Repository Layout
 - `minesweeper/` – environment, policy/value networks, PPO implementation
 - `webui/` – FastAPI backend and static client
-- `configs/` – training/eval configs (current default is 16×16×40 medium)
+- `configs/` – training (`training/`) and evaluation (`eval/`) configs for 16×16×40
 - `scripts/` – helper scripts and smoke tests
 - `docs/` – supplementary notes (e.g., architecture overview)
 - `runs/` – sample checkpoints and metrics (you can remove or replace with your own)
