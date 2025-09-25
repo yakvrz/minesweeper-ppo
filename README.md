@@ -15,14 +15,14 @@ End-to-end reinforcement learning project that trains a CNN policy/value network
 ## Model Card
 | Field | Value |
 | --- | --- |
-| **Architecture** | Residual CNN (stem 128 ch, 6 blocks, mine-prob head) |
+| **Architecture** | Residual CNN (stem 128 ch, 6 blocks) with separate mine-probability head for diagnostics |
 | **Checkpoint** | `runs/scaling16_medium_u4000/ckpt_final.pt` |
 | **Observation** | 10-channel tensor (revealed mask + one-hot counts) |
 | **Action space** | Reveal cell only (256 logits) |
-| **Training** | PPO (γ=0.995, λ=0.95, 192 envs × 64 steps, 4000 updates) |
+| **Training** | PPO (γ=0.995, λ=0.95, 192 envs × 64 steps, 4000 updates); no supervised labels are used for the policy |
 | **Reward** | +1 / −1 terminal, −1e-4 per move |
 | **Evaluation metrics** | Win 84 %, AUROC 0.93, ECE 0.073 |
-| **Limitations** | Calibrated only on 16×16×40; auxiliary belief head underestimates risk outside trained frontier patterns |
+| **Limitations** | Mine-probability head is for interpretability only; calibrated on 16×16×40 frontier states |
 
 ## Web UI
 Launch the dashboard to inspect a checkpoint and play interactively:
