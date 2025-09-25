@@ -1,19 +1,19 @@
 env:
-  H: 8
-  W: 8
-  mine_count: 10
-  guarantee_safe_neighborhood: false
+  H: 16
+  W: 16
+  mine_count: 40
+  guarantee_safe_neighborhood: true
   step_penalty: 0.0001
 
 model:
   name: cnn_residual
   stem_channels: 96
-  blocks: 4
+  blocks: 5
   dropout: 0.05
-  value_hidden: 192
+  value_hidden: 256
 
 ppo:
-  num_envs: 192
+  num_envs: 128
   steps_per_env: 64
   mini_batches: 8
   ppo_epochs: 3
@@ -28,11 +28,11 @@ ppo:
   max_grad_norm: 0.5
   aux_mine_weight: 0.05
   aux_mine_calib_weight: 0.01
-  total_updates: 1200
+  total_updates: 4000
 
 training:
   beta_l2: 0.0
-  early_stop_patience: 100
+  early_stop_patience: 400
   rollout:
-    num_envs: 192
+    num_envs: 128
     steps_per_env: 64

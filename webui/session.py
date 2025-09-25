@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,30 +11,27 @@ from minesweeper.env import EnvConfig, MinesweeperEnv
 from minesweeper.models import build_model
 
 
-BOARD_PRESETS: Dict[str, Dict[str, Any]] = {
-    "8x8": {"rows": 8, "cols": 8, "mines": 10, "label": "8×8 · 10 mines"},
-    "16x16": {"rows": 16, "cols": 16, "mines": 40, "label": "16×16 · 40 mines"},
-}
-
-
 @dataclass
 class BoardState:
     rows: int
     cols: int
     mine_count: int
-    preset: str
-    preset_label: str
-    preset_options: List[Dict[str, str]]
+    board_label: str
+    total_cells: int
+    revealed_count: int
+    remaining_hidden: int
+    mine_probabilities: List[List[Optional[float]]]
+    next_move: Optional[Dict[str, Any]]
+    flags: List[List[bool]]
     revealed: List[List[bool]]
     counts: List[List[int]]
-    safe_probabilities: List[List[Optional[float]]]
     done: bool
     outcome: Optional[str]
     step: int
 
 
 class MinesweeperSession:
-    """Load a trained checkpoint and expose interactive env state + probabilities."""
+    """Interactive Minesweeper session backed by a single 16×16×40 checkpoint."""
 
     def __init__(
         self,
@@ -49,14 +46,15 @@ class MinesweeperSession:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._rng = np.random.default_rng(seed)
+
         self.env_cfg = self._load_env_config()
         self.env = self._init_env()
+
         self.model = self._load_model().to(self.device)
         self.model.eval()
 
-        self._current_preset = self._match_preset(self.env_cfg)
-
         self._last_obs: Dict[str, Any] = self.env.reset()
+        self._user_flags = np.zeros((self.env.H, self.env.W), dtype=bool)
         self._last_done = False
         self._last_outcome: Optional[str] = None
 
@@ -64,9 +62,9 @@ class MinesweeperSession:
         ckpt = torch.load(self.checkpoint_path, map_location="cpu")
         cfg = ckpt.get("cfg", {})
         return EnvConfig(
-            H=int(cfg.get("H", 8)),
-            W=int(cfg.get("W", 8)),
-            mine_count=int(cfg.get("mine_count", 10)),
+            H=int(cfg.get("H", 16)),
+            W=int(cfg.get("W", 16)),
+            mine_count=int(cfg.get("mine_count", 40)),
             guarantee_safe_neighborhood=bool(cfg.get("guarantee_safe_neighborhood", True)),
             step_penalty=float(cfg.get("step_penalty", EnvConfig.step_penalty)),
         )
@@ -90,31 +88,29 @@ class MinesweeperSession:
     def reset(self, seed: Optional[int] = None) -> BoardState:
         self.env = self._init_env(seed=seed)
         self._last_obs = self.env.reset()
+        self._user_flags = np.zeros((self.env.H, self.env.W), dtype=bool)
         self._last_done = False
         self._last_outcome = None
         return self._build_state()
 
-    def set_board_preset(self, preset: str, seed: Optional[int] = None) -> BoardState:
-        preset_key = preset.lower()
-        if preset_key not in BOARD_PRESETS:
-            raise ValueError(f"Unknown board preset: {preset}")
-        preset_cfg = BOARD_PRESETS[preset_key]
-        self.env_cfg = replace(
-            self.env_cfg,
-            H=int(preset_cfg["rows"]),
-            W=int(preset_cfg["cols"]),
-            mine_count=int(preset_cfg["mines"]),
-        )
-        self._current_preset = preset_key
-        return self.reset(seed=seed)
+    def toggle_flag(self, row: int, col: int) -> BoardState:
+        if not (0 <= row < self.env.H and 0 <= col < self.env.W):
+            raise ValueError(f"Cell out of bounds: ({row}, {col})")
+        if self._last_done or self.env.revealed[row, col]:
+            return self._build_state()
+        self._user_flags[row, col] = ~self._user_flags[row, col]
+        return self._build_state()
 
     def click(self, row: int, col: int) -> BoardState:
         if not (0 <= row < self.env.H and 0 <= col < self.env.W):
             raise ValueError(f"Cell out of bounds: ({row}, {col})")
+        if self._user_flags[row, col]:
+            return self._build_state()
 
         action = row * self.env.W + col
-        obs, reward, done, info = self.env.step(action)
+        obs, _reward, done, info = self.env.step(action)
         self._last_obs = obs
+        self._user_flags[row, col] = False
         self._last_done = done
         self._last_outcome = info.get("outcome")
         return self._build_state()
@@ -122,76 +118,71 @@ class MinesweeperSession:
     def current_state(self) -> BoardState:
         return self._build_state()
 
-    def _compute_safe_probabilities(self) -> np.ndarray:
+    def _run_inference(self) -> tuple[np.ndarray, Optional[Dict[str, Any]]]:
         obs = self._last_obs["obs"]
-        action_mask = self._last_obs["action_mask"].reshape(self.env.H, self.env.W)
+        action_mask_flat = self._last_obs["action_mask"].astype(bool)
+        mask_grid = action_mask_flat.reshape(self.env.H, self.env.W)
+        mask_grid &= ~self._user_flags
+        action_mask_flat = mask_grid.reshape(-1)
+
         obs_tensor = torch.from_numpy(obs[None]).to(self.device, dtype=torch.float32)
         with torch.no_grad():
-            logits, value, mine_logits = self.model(obs_tensor, return_mine=True)
-        if mine_logits is None:
-            raise RuntimeError("Checkpoint does not include mine-probability head")
+            policy_logits, _, mine_logits = self.model(obs_tensor, return_mine=True)
+
         mine_prob = torch.sigmoid(mine_logits).squeeze(0).squeeze(0).cpu().numpy()
-        safe_prob = 1.0 - mine_prob
-        # Mask out revealed cells so we do not leak finished tiles.
-        safe_prob = safe_prob.copy()
-        safe_prob[~action_mask] = np.nan
-        return safe_prob
+        mine_prob_masked = mine_prob.copy()
+        mine_prob_masked[self._user_flags] = np.nan
+        mine_prob_masked[~mask_grid] = np.nan
+
+        action_mask_tensor = torch.from_numpy(action_mask_flat).to(policy_logits.device, dtype=torch.bool)
+        if not bool(action_mask_tensor.any().item()) or self.env.step_count == 0:
+            next_move = None
+        else:
+            masked_logits = policy_logits[0].clone()
+            masked_logits[~action_mask_tensor] = -1e9
+            best_action = int(masked_logits.argmax().item())
+            row, col = divmod(best_action, self.env.W)
+            next_move = {
+                "action": best_action,
+                "row": row,
+                "col": col,
+                "logit": float(policy_logits[0, best_action].item()),
+                "mine_probability": float(mine_prob[row, col]),
+            }
+
+        return mine_prob_masked, next_move
 
     def _build_state(self) -> BoardState:
-        safe_prob = self._compute_safe_probabilities()
+        mine_prob_map, next_move = self._run_inference()
         revealed = self.env.revealed
         counts = self.env.adjacent_counts
 
-        safe_prob_serializable: List[List[Optional[float]]] = []
+        mine_prob_serializable: List[List[Optional[float]]] = []
         for r in range(self.env.H):
             row_vals: List[Optional[float]] = []
             for c in range(self.env.W):
-                sp = float(safe_prob[r, c]) if not np.isnan(safe_prob[r, c]) else None
-                row_vals.append(sp)
-            safe_prob_serializable.append(row_vals)
+                val = mine_prob_map[r, c]
+                row_vals.append(float(val) if not np.isnan(val) else None)
+            mine_prob_serializable.append(row_vals)
 
-        preset_key = self._current_preset
-        preset_label = self._preset_label(preset_key)
-        preset_options = self._preset_options()
+        revealed_count = int(revealed.sum())
+        total_cells = int(self.env.H * self.env.W)
+        remaining_hidden = max(0, total_cells - revealed_count)
 
         return BoardState(
             rows=self.env.H,
             cols=self.env.W,
             mine_count=int(self.env.cfg.mine_count),
-            preset=preset_key,
-            preset_label=preset_label,
-            preset_options=preset_options,
+            board_label=f"{self.env.H}×{self.env.W}",
+            total_cells=total_cells,
+            revealed_count=revealed_count,
+            remaining_hidden=remaining_hidden,
+            mine_probabilities=mine_prob_serializable,
+            next_move=next_move,
+            flags=self._user_flags.astype(bool).tolist(),
             revealed=revealed.astype(bool).tolist(),
             counts=counts.astype(int).tolist(),
-            safe_probabilities=safe_prob_serializable,
             done=bool(self._last_done),
             outcome=self._last_outcome,
             step=int(self.env.step_count),
         )
-
-    def _preset_label(self, preset: str) -> str:
-        if preset in BOARD_PRESETS:
-            return BOARD_PRESETS[preset]["label"]
-        return f"{self.env_cfg.H}×{self.env_cfg.W} · {self.env_cfg.mine_count} mines"
-
-    def _preset_options(self) -> List[Dict[str, str]]:
-        options = [
-            {"id": key, "label": cfg["label"]}
-            for key, cfg in BOARD_PRESETS.items()
-        ]
-        if self._current_preset not in BOARD_PRESETS:
-            options.append({
-                "id": self._current_preset,
-                "label": self._preset_label(self._current_preset),
-            })
-        return options
-
-    def _match_preset(self, cfg: EnvConfig) -> str:
-        for key, preset in BOARD_PRESETS.items():
-            if (
-                int(preset["rows"]) == int(cfg.H)
-                and int(preset["cols"]) == int(cfg.W)
-                and int(preset["mines"]) == int(cfg.mine_count)
-            ):
-                return key
-        return "custom"

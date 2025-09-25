@@ -1,56 +1,66 @@
-# minesweeper-rl (prototype)
+# minesweeper-rl
 
-Single-GPU Minesweeper RL prototype per `ARCHITECTURE.md`.
+Interactive Minesweeper agent trained on 16×16×40 boards, complete with a FastAPI-powered web UI for exploring the model’s beliefs and recommended moves.
 
-## Quickstart
+## Requirements
 
-- Install deps: `pip install -r requirements.txt`
-- Recommended: set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before training to reduce CUDA memory fragmentation (e.g., `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
-- Play locally: `python scripts/play_local.py`
-- PPO training (CNN): `python train_rl.py --config configs/small_8x8_10.yaml --out runs/ppo`
-- Evaluate latest checkpoint: `PYTHONPATH=. python eval.py --run_dir runs/ppo --config configs/small_8x8_10.yaml --episodes 64 --num_envs 64 --progress`
+- Python 3.11+
+- PyTorch 2.1+
 
-### Interactive Web UI
+Install dependencies:
 
-You can visualize a trained checkpoint inside an interactive Minesweeper board with the model’s safety probabilities overlaid on each unrevealed cell:
+```bash
+pip install -r requirements.txt
+```
 
-- Install deps (including FastAPI): `pip install -r requirements.txt`
-- Point the app at a checkpoint (defaults to `runs/baseline_quick20_u200/ckpt_best.pt`): `export MINESWEEPER_CKPT=/path/to/ckpt.pt`
-- Launch the web server: `uvicorn webui.app:app --reload`
-- Open http://127.0.0.1:8000 in your browser and start revealing tiles. Toggle the overlay to show or hide the mine-heatmap; deeper red means higher mine probability (`100%` = certain mine).
-- Use the board preset dropdown in the header to switch between the default 8×8×10 layout and a 16×16×40 board (the same checkpoint powers both via its convolutional trunk).
-- Optional smoke test for the API layer: `PYTHONPATH=. python scripts/test_webui.py`
+## Interactive Web UI
 
-## Reveal-only training (tiny example)
+Launch the local dashboard with your checkpoint (defaults to `runs/scaling16_medium_u4000/ckpt_final.pt`, override via `MINESWEEPER_CKPT_16`):
 
-- Tiny PPO: `python train_rl.py --config configs/tiny_6x6_6.yaml --out runs/tiny_reveal --updates 200`
-- Optional fast smoke run: `python train_rl.py --config configs/smoke.yaml --out runs/smoke --updates 40`
+```bash
+export MINESWEEPER_CKPT_16=/path/to/ckpt.pt  # optional
+uvicorn webui.app:app --reload
+```
 
-The environment now auto-applies all provable deductions after each reveal (flags + safe reveals + chord). Rewards are:
+Open http://127.0.0.1:8000 to play:
 
-- `+1 / -1` on win/loss
-- `-step_penalty` each step for mild efficiency pressure
+- Left-click reveals a tile; right-click (or two-finger tap) toggles a flag.
+- The glowing tile shows the policy’s next recommended move and displays the model’s mine probability for that cell.
+- Live stats track steps, revealed cells, and remaining hidden tiles.
 
-No explicit flag actions or penalties remain—the agent purely learns where to reveal.
+Run the smoke test to verify the API:
 
-### Env config knobs
+```bash
+PYTHONPATH=. python scripts/test_webui.py
+```
 
-- `step_penalty` (default `1e-4`)
+## Evaluation
 
-- Win rate (primary) and average steps from the reveal-only evaluation.
-- Average normalized progress (`avg_progress`).
-- Optional: compare different reveal policies via offline analysis; `eval.py` now always runs the greedy reveal policy.
+To evaluate a checkpoint offline, use the provided scaling config:
 
-## Layout
+```bash
+PYTHONPATH=. python eval.py \
+  --ckpt runs/scaling16_medium_u4000/ckpt_final.pt \
+  --config configs/scaling/cnn_residual_16x16x40_medium.yaml \
+  --episodes 256 --num_envs 64 --progress
+```
 
-- `minesweeper/env.py`: NumPy env + vectorized wrapper
-- `minesweeper/rules.py`: Forced-move solver
-- `minesweeper/models.py`: CNN-based policies with shared builder (`build_model`)
-- `minesweeper/buffers.py`: PPO rollout buffer with GAE
-- `minesweeper/ppo.py`: PPO update (masked)
-- `eval.py`: Evaluation CLI and utilities. Reports win rate, belief calibration, and new avoidability metrics (`forced_guess_rate`, `safe_option_rate`, `safe_option_pick_rate`, etc.) that quantify how often the agent truly has to guess versus skipping provably safe tiles.
-- `viz.py`: ASCII/heatmap utilities
-- `configs/`: YAML configs (`cnn_residual_6x6x4.yaml`, `cnn_residual_8x8x10.yaml`, `cnn_residual_16x16x40.yaml`)
-- `scripts/`: Helper scripts (e.g., `play_local.py` for interactive play)
+## Training
 
-See `ARCHITECTURE.md` for full details.
+The project includes reference PPO training scripts. For example, to train the residual CNN on 16×16×40 boards:
+
+```bash
+python train_rl.py --config configs/scaling/cnn_residual_16x16x40_medium.yaml --out runs/experiment_name
+```
+
+Refer to `ARCHITECTURE.md` for details on the environment, model, and training loop design.
+
+## Repository Layout
+
+- `minesweeper/` – Environment, models, and PPO implementation
+- `webui/` – FastAPI service and static client
+- `configs/` – Training and evaluation configs (16×16×40)
+- `scripts/` – Utilities and tests
+- `docs/` – Supplemental notes
+
+Enjoy exploring the agent!

@@ -8,32 +8,65 @@
 <body>
   <div class="app">
     <header class="top-bar">
-      <h1>Minesweeper RL</h1>
+      <div class="brand">
+        <h1>Minesweeper RL</h1>
+        <p>Model-guided board explorer</p>
+      </div>
       <div class="controls">
         <button id="new-game" type="button">New Game</button>
-        <label class="board-select-wrapper">
-          <span class="sr-only">Board preset</span>
-          <select id="board-select" class="board-select" aria-label="Board preset"></select>
-        </label>
-        <button id="toggle-overlay" type="button" class="secondary">Hide Mine Probabilities</button>
-        <span id="status" class="status">Ready</span>
+        <span id="status" class="status-pill is-live">Ready</span>
       </div>
     </header>
-    <section class="board-wrapper">
-      <div id="board" class="board" role="grid" aria-label="Minesweeper board"></div>
-      <div id="game-over" class="game-over" role="alert" aria-live="assertive">
-        <div class="game-over__panel">
-          <div id="game-over-message" class="game-over__message"></div>
-          <div class="game-over__actions">
-            <button id="game-over-reset" type="button">Play Again</button>
+
+    <main class="layout">
+      <section class="board-shell">
+        <div class="board-meta">
+          <div class="board-meta__header">
+            <span class="board-tag" id="board-preset-label">16×16 · 40 mines</span>
+            <span class="board-subtitle" id="board-outcome">Live</span>
+          </div>
+          <div class="board-stats">
+            <div class="stat-block">
+              <span class="stat-label">Step</span>
+              <span class="stat-value" id="stat-step">0</span>
+            </div>
+            <div class="stat-block">
+              <span class="stat-label">Revealed</span>
+              <span class="stat-value" id="stat-revealed">0</span>
+            </div>
+            <div class="stat-block">
+              <span class="stat-label">Hidden</span>
+              <span class="stat-value" id="stat-hidden">256</span>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
-    <section class="legend">
-      <h2>Legend</h2>
-      <p>Red shading grows stronger as a cell becomes more likely to hide a mine (100% = certain mine). The percentage shows the model&apos;s mine probability estimate.</p>
-    </section>
+        <div class="board-wrapper">
+          <div id="board" class="board" role="grid" aria-label="Minesweeper board"></div>
+          <div id="game-over" class="game-over" role="alert" aria-live="assertive">
+            <div class="game-over__panel">
+              <div id="game-over-message" class="game-over__message"></div>
+              <div class="game-over__actions">
+                <button id="game-over-reset" type="button">Play Again</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="panel legend-panel">
+          <h2>Next Move Highlight</h2>
+          <p class="legend-copy">The glowing tile marks the policy’s suggested action. Its badge shows the predicted mine probability for that cell.</p>
+        </section>
+        <section class="panel tips-panel">
+          <h2>Quick Tips</h2>
+          <ul class="tips-list">
+            <li>Left-click to reveal, right-click (or two-finger tap) to toggle a flag.</li>
+            <li>The highlight updates after every reveal to show the model’s next choice and its confidence.</li>
+          </ul>
+        </section>
+      </aside>
+    </main>
   </div>
   <script type="module" src="/static/app.js"></script>
 </body>

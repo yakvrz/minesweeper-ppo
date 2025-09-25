@@ -1,93 +1,55 @@
 const boardEl = document.getElementById('board');
 const statusEl = document.getElementById('status');
 const newGameBtn = document.getElementById('new-game');
-const toggleOverlayBtn = document.getElementById('toggle-overlay');
-const boardSelect = document.getElementById('board-select');
+const boardPresetLabel = document.getElementById('board-preset-label');
+const boardOutcomeEl = document.getElementById('board-outcome');
+const statStepEl = document.getElementById('stat-step');
+const statRevealedEl = document.getElementById('stat-revealed');
+const statHiddenEl = document.getElementById('stat-hidden');
 const gameOverEl = document.getElementById('game-over');
 const gameOverMessageEl = document.getElementById('game-over-message');
 const gameOverResetBtn = document.getElementById('game-over-reset');
 
 let currentState = null;
 let isBusy = false;
-let overlayEnabled = true;
-let presetCacheSignature = '';
-
-const updateOverlayControl = () => {
-  toggleOverlayBtn.textContent = overlayEnabled ? 'Hide Mine Probabilities' : 'Show Mine Probabilities';
-  toggleOverlayBtn.setAttribute('aria-pressed', overlayEnabled ? 'true' : 'false');
-};
+let flagBusy = false;
 
 const formatPercent = (value) => {
-  if (value === null || Number.isNaN(value)) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
     return '';
   }
-  return `${Math.round(value * 100)}%`;
+  return `${Math.round(Number(value) * 100)}%`;
 };
 
-const mineColor = (prob) => {
-  const mine = Math.min(Math.max(prob, 0), 1);
-  const alpha = mine * 0.85;
-  return `rgba(239, 68, 68, ${alpha})`;
-};
+if (boardEl) {
+  boardEl.addEventListener('contextmenu', (event) => event.preventDefault());
+}
 
-const applyMineProbabilityDecor = (cell, overlayEl, labelEl, safeProb, row, col) => {
-  const rowIdx = row + 1;
-  const colIdx = col + 1;
-  const hasProb = safeProb !== null && !Number.isNaN(safeProb);
-  if (!hasProb) {
-    cell.classList.remove('show-overlay');
-    overlayEl.style.backgroundColor = 'transparent';
-    overlayEl.style.opacity = 0;
-    labelEl.textContent = '';
-    labelEl.setAttribute('aria-hidden', 'true');
-    cell.removeAttribute('data-mine-percent');
-    cell.setAttribute('title', `Cell ${rowIdx}-${colIdx}: mine probability unavailable`);
-    cell.setAttribute('aria-label', `Cell ${rowIdx}, ${colIdx}: mine probability unavailable`);
-    cell.style.removeProperty('--cell-border');
-    return;
-  }
-
-  const mineProb = 1 - safeProb;
-  const clamped = Math.min(Math.max(mineProb, 0), 1);
-  const percent = Math.round(clamped * 100);
-  overlayEl.style.backgroundColor = mineColor(clamped);
-  const overlayActive = overlayEnabled && clamped > 0;
-  const overlayStrength = overlayActive ? Math.min(1, clamped + 0.05) : 0;
-  overlayEl.style.opacity = overlayStrength;
-  labelEl.textContent = overlayActive ? `${percent}%` : '';
-  labelEl.setAttribute('aria-hidden', overlayActive ? 'false' : 'true');
-  cell.dataset.minePercent = String(percent);
-  cell.setAttribute('title', `Cell ${rowIdx}-${colIdx}: mine probability ${percent}%`);
-  cell.setAttribute('aria-label', `Cell ${rowIdx}, ${colIdx}: mine probability ${percent} percent`);
-
-  if (overlayActive) {
-    cell.classList.add('show-overlay');
-    cell.style.setProperty('--cell-border', `rgba(239, 68, 68, ${clamped * 0.6})`);
-  } else {
-    cell.classList.remove('show-overlay');
-    cell.style.removeProperty('--cell-border');
-  }
+const setStatus = (mode, text) => {
+  statusEl.textContent = text;
+  statusEl.classList.remove('is-live', 'is-win', 'is-loss');
+  statusEl.classList.add(mode);
 };
 
 const updateStatus = (state, message = null) => {
   if (message) {
-    statusEl.textContent = message;
+    setStatus('is-live', message);
     return;
   }
   if (!state) {
-    statusEl.textContent = 'Loading…';
+    setStatus('is-live', 'Loading…');
     return;
   }
   if (state.done) {
     if (state.outcome === 'win') {
-      statusEl.textContent = `Win in ${state.step} steps`;
+      setStatus('is-win', `Win in ${state.step} steps`);
     } else if (state.outcome === 'loss') {
-      statusEl.textContent = `Game over after ${state.step} steps`;
+      setStatus('is-loss', `Mine hit on step ${state.step}`);
     } else {
-      statusEl.textContent = 'Game finished';
+      setStatus('is-live', `Finished in ${state.step} steps`);
     }
   } else {
-    statusEl.textContent = `Step ${state.step}`;
+    setStatus('is-live', `Step ${state.step}`);
   }
 };
 
@@ -119,22 +81,25 @@ const updateGameOver = (state) => {
 };
 
 const renderBoard = (state) => {
-  boardEl.classList.toggle('overlay-enabled', overlayEnabled);
-  boardEl.classList.toggle('is-complete', Boolean(state.done));
-  boardEl.style.setProperty('--rows', state.rows);
-  boardEl.style.setProperty('--cols', state.cols);
+  boardEl.classList.toggle('board-compact', state.cols >= 12);
   boardEl.innerHTML = '';
+
+  const nextMove = state.step > 0 ? state.next_move : null;
+  const flags = state.flags || [];
+  const mineProbs = state.mine_probabilities || [];
 
   for (let r = 0; r < state.rows; r += 1) {
     for (let c = 0; c < state.cols; c += 1) {
       const revealed = state.revealed[r][c];
-      const prob = state.safe_probabilities[r][c];
       const count = state.counts[r][c];
+      const flagged = flags[r] ? Boolean(flags[r][c]) : false;
+      const mineProb = mineProbs[r] ? mineProbs[r][c] : null;
 
       const cell = document.createElement('button');
       cell.type = 'button';
       cell.dataset.row = String(r);
       cell.dataset.col = String(c);
+      cell.dataset.flagged = flagged ? '1' : '0';
       cell.classList.add('cell');
 
       const face = document.createElement('span');
@@ -149,24 +114,34 @@ const renderBoard = (state) => {
         } else {
           face.innerHTML = '&nbsp;';
         }
+        cell.dataset.flagged = '0';
         cell.disabled = true;
         cell.removeAttribute('title');
+        cell.classList.remove('next-move');
       } else {
-        cell.classList.add('hidden');
-        face.innerHTML = '&nbsp;';
+        face.textContent = flagged ? '⚑' : '';
+        if (!flagged) {
+          face.innerHTML = '&nbsp;';
+        }
+        cell.classList.toggle('flagged', flagged);
+        const baseAria = `Cell ${r + 1}, ${c + 1}`;
+        cell.setAttribute('aria-label', flagged ? `${baseAria}: flagged` : baseAria);
 
-        const overlay = document.createElement('span');
-        overlay.classList.add('mine-overlay');
-        overlay.setAttribute('aria-hidden', 'true');
-        cell.appendChild(overlay);
+        if (nextMove && nextMove.row === r && nextMove.col === c && !flagged) {
+          cell.classList.add('next-move');
+          const label = document.createElement('span');
+          label.classList.add('mine-label', 'label-next');
+          const percentText = formatPercent(mineProb);
+          label.textContent = percentText ? `${percentText} NEXT` : 'NEXT';
+          label.setAttribute('aria-hidden', 'false');
+          cell.appendChild(label);
+          const ariaText = percentText
+            ? `${baseAria}: suggested next move (${percentText})`
+            : `${baseAria}: suggested next move`;
+          cell.setAttribute('aria-label', ariaText);
+        }
 
-        const label = document.createElement('span');
-        label.classList.add('mine-label');
-        label.setAttribute('aria-hidden', overlayEnabled ? 'false' : 'true');
-        cell.appendChild(label);
-
-        applyMineProbabilityDecor(cell, overlay, label, prob, r, c);
-
+        cell.addEventListener('contextmenu', onCellContextMenu);
         if (state.done) {
           cell.disabled = true;
         } else {
@@ -202,12 +177,44 @@ const postJson = async (url, payload) => {
   return handleResponse(resp);
 };
 
+const toggleFlag = async ({ row, col }) => {
+  if (flagBusy || !currentState || currentState.done) {
+    return;
+  }
+  flagBusy = true;
+  try {
+    const nextState = await postJson('/api/flag', { row, col });
+    refresh(nextState);
+  } catch (err) {
+    console.error(err);
+    updateStatus(currentState, 'Failed to toggle flag');
+  } finally {
+    flagBusy = false;
+  }
+};
+
 const refresh = (state) => {
   currentState = state;
   renderBoard(state);
   updateStatus(state);
+  updateHud(state);
   updateGameOver(state);
-  syncBoardOptions(state);
+};
+
+const onCellContextMenu = (event) => {
+  event.preventDefault();
+  const row = Number(event.currentTarget.dataset.row);
+  const col = Number(event.currentTarget.dataset.col);
+  if (!Number.isInteger(row) || !Number.isInteger(col)) {
+    return;
+  }
+  if (!currentState || currentState.done) {
+    return;
+  }
+  if (currentState.revealed[row][col]) {
+    return;
+  }
+  toggleFlag({ row, col });
 };
 
 const onCellClick = async (event) => {
@@ -216,7 +223,12 @@ const onCellClick = async (event) => {
   }
   const row = Number(event.currentTarget.dataset.row);
   const col = Number(event.currentTarget.dataset.col);
-
+  if (!Number.isInteger(row) || !Number.isInteger(col)) {
+    return;
+  }
+  if (currentState && currentState.flags && currentState.flags[row] && currentState.flags[row][col]) {
+    return;
+  }
   isBusy = true;
   updateStatus(currentState, 'Revealing…');
   try {
@@ -230,18 +242,15 @@ const onCellClick = async (event) => {
   }
 };
 
-const startNewGame = async ({ preset = null, seed = null } = {}) => {
-  if (isBusy) {
+const startNewGame = async ({ seed = null } = {}) => {
+  if (isBusy || flagBusy) {
     return;
   }
   isBusy = true;
-  updateStatus(null, preset ? 'Loading board…' : 'Resetting…');
+  updateStatus(null, 'Resetting…');
   hideGameOver();
   try {
     const payload = {};
-    if (preset) {
-      payload.preset = preset;
-    }
     if (seed !== null && seed !== undefined) {
       payload.seed = seed;
     }
@@ -256,17 +265,11 @@ const startNewGame = async ({ preset = null, seed = null } = {}) => {
 };
 
 newGameBtn.addEventListener('click', () => startNewGame());
-toggleOverlayBtn.addEventListener('click', () => {
-  overlayEnabled = !overlayEnabled;
-  updateOverlayControl();
-  if (currentState) {
-    renderBoard(currentState);
-  }
-});
+
+gameOverResetBtn.addEventListener('click', () => startNewGame());
 
 const bootstrap = async () => {
   updateStatus(null, 'Loading…');
-  updateOverlayControl();
   try {
     const state = await fetchState();
     refresh(state);
@@ -276,48 +279,32 @@ const bootstrap = async () => {
   }
 };
 
-gameOverResetBtn.addEventListener('click', () => startNewGame());
-
-bootstrap();
-
-function syncBoardOptions(state) {
-  if (!boardSelect || !state || !Array.isArray(state.preset_options)) {
+function updateHud(state) {
+  if (!state) {
     return;
   }
 
-  const signature = state.preset_options
-    .map((opt) => `${opt.id}:${opt.label}`)
-    .join('|');
-
-  if (signature !== presetCacheSignature) {
-    presetCacheSignature = signature;
-    boardSelect.innerHTML = '';
-    state.preset_options.forEach((opt) => {
-      const optionEl = document.createElement('option');
-      optionEl.value = opt.id;
-      optionEl.textContent = opt.label;
-      boardSelect.appendChild(optionEl);
-    });
+  if (boardPresetLabel) {
+    const detail = `${state.mine_count ?? '?'} mines · ${state.total_cells ?? state.rows * state.cols} tiles`;
+    const label = state.board_label || `${state.rows}×${state.cols}`;
+    boardPresetLabel.textContent = `${label} · ${detail}`;
   }
-
-  const hasCurrentOption = state.preset_options.some((opt) => opt.id === state.preset);
-  if (!hasCurrentOption && state.preset) {
-    const optionEl = document.createElement('option');
-    optionEl.value = state.preset;
-    optionEl.textContent = state.preset_label || state.preset;
-    boardSelect.appendChild(optionEl);
+  if (boardOutcomeEl) {
+    if (state.done) {
+      boardOutcomeEl.textContent = state.outcome === 'win' ? 'Victory' : state.outcome === 'loss' ? 'Mine triggered' : 'Finished';
+    } else {
+      boardOutcomeEl.textContent = 'Live';
+    }
   }
-
-  if (state.preset) {
-    boardSelect.value = state.preset;
+  if (statStepEl) {
+    statStepEl.textContent = String(state.step ?? 0);
   }
-  boardSelect.title = state.preset_label || '';
+  if (statRevealedEl) {
+    statRevealedEl.textContent = String(state.revealed_count ?? 0);
+  }
+  if (statHiddenEl) {
+    statHiddenEl.textContent = String(state.remaining_hidden ?? 0);
+  }
 }
 
-boardSelect?.addEventListener('change', (event) => {
-  const nextPreset = event.target.value;
-  if (!nextPreset || (currentState && currentState.preset === nextPreset)) {
-    return;
-  }
-  startNewGame({ preset: nextPreset });
-});
+bootstrap();

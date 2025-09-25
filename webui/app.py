@@ -18,16 +18,21 @@ class ClickRequest(BaseModel):
     col: int
 
 
+class FlagRequest(BaseModel):
+    row: int
+    col: int
+
+
 class NewGameRequest(BaseModel):
     seed: Optional[int] = None
-    preset: Optional[str] = None
 
 
 def _default_checkpoint() -> Path:
-    env_path = os.environ.get("MINESWEEPER_CKPT")
-    if env_path:
-        return Path(env_path)
-    return Path("runs/baseline_quick20_u200/ckpt_best.pt")
+    for env_var in ("MINESWEEPER_CKPT_16", "MINESWEEPER_CKPT"):
+        env_path = os.environ.get(env_var)
+        if env_path:
+            return Path(env_path)
+    return Path("runs/scaling16_medium_u4000/ckpt_final.pt")
 
 
 app = FastAPI()
@@ -40,7 +45,7 @@ def _load_session() -> None:
     ckpt_path = _default_checkpoint()
     if not ckpt_path.exists():
         raise RuntimeError(
-            f"Checkpoint path not found: {ckpt_path}. Set MINESWEEPER_CKPT env var."
+            f"Checkpoint path not found: {ckpt_path}. Set MINESWEEPER_CKPT_16 env var."
         )
     app.state.session = MinesweeperSession(ckpt_path)
 
@@ -66,18 +71,20 @@ def get_state() -> dict:
 
 @app.post("/api/new-game")
 def new_game(req: NewGameRequest) -> dict:
-    session = _get_session()
-    if req.preset:
-        try:
-            state = session.set_board_preset(req.preset, seed=req.seed)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    else:
-        state = session.reset(seed=req.seed)
+    state = _get_session().reset(seed=req.seed)
     return asdict(state)
 
 
 @app.post("/api/click")
 def click_cell(req: ClickRequest) -> dict:
     state = _get_session().click(req.row, req.col)
+    return asdict(state)
+
+
+@app.post("/api/flag")
+def flag_cell(req: FlagRequest) -> dict:
+    try:
+        state = _get_session().toggle_flag(req.row, req.col)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return asdict(state)
